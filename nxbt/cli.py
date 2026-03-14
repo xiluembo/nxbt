@@ -107,6 +107,7 @@ parser.add_argument(
 )
 args = None
 TUI_IMPORT_DEPENDENCIES = {"blessed", "psutil"}
+WEB_IMPORT_DEPENDENCIES = {"flask", "flask_socketio"}
 
 
 MACRO = """
@@ -431,11 +432,18 @@ def list_switch_addresses():
     print("---------------------------")
 
 
+def _is_missing_dependency(exc, dependency_names):
+    if exc.name in dependency_names:
+        return True
+    error_text = str(exc)
+    return any(name in error_text for name in dependency_names)
+
+
 def _start_tui(force_remote=False):
     try:
         from .tui import InputTUI
     except ModuleNotFoundError as exc:
-        if exc.name in TUI_IMPORT_DEPENDENCIES:
+        if _is_missing_dependency(exc, TUI_IMPORT_DEPENDENCIES):
             print("The TUI dependencies are not installed.")
             print("Install nxbt's terminal dependencies and try again.")
             print("Suggested command:")
@@ -448,13 +456,34 @@ def _start_tui(force_remote=False):
     tui.start()
 
 
+def _start_webapp(ip, port, usessl, cert_path):
+    try:
+        from .web import start_web_app
+    except ModuleNotFoundError as exc:
+        if _is_missing_dependency(exc, WEB_IMPORT_DEPENDENCIES):
+            print("The webapp dependencies are not installed.")
+            print("Install nxbt's web dependencies and try again.")
+            print("Suggested command:")
+            print("python -m pip install Flask==3.1.0 Flask-SocketIO==5.3.4")
+            return
+        raise
+
+    try:
+        start_web_app(
+            ip=ip,
+            port=port,
+            usessl=usessl,
+            cert_path=cert_path,
+        )
+    except OSError as exc:
+        print(exc)
+
+
 def main():
     cli_args = parsed_args()
 
     if cli_args.command == "webapp":
-        from .web import start_web_app
-
-        start_web_app(
+        _start_webapp(
             ip=cli_args.ip,
             port=cli_args.port,
             usessl=cli_args.usessl,

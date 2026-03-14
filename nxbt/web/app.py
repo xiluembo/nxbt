@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import sys
 from threading import RLock
 import time
@@ -39,6 +40,21 @@ sio = SocketIO(app, cookie=False)
 
 user_info_lock = RLock()
 USER_INFO = {}
+
+
+def _ensure_server_bind_available(ip, port):
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((ip, port))
+    except OSError as exc:
+        message = f"Unable to bind the NXBT webapp to {ip}:{port}."
+        if getattr(exc, "winerror", None) == 10013:
+            message += " This port is blocked on this Windows host."
+            if port == 8000:
+                message += " Try `--port 8080`."
+        raise OSError(message) from exc
+    finally:
+        probe.close()
 
 
 @app.route('/')
@@ -111,6 +127,8 @@ def handle_macro(message):
 
 
 def start_web_app(ip='0.0.0.0', port=8000, usessl=False, cert_path=None):
+    _ensure_server_bind_available(ip, port)
+
     if usessl:
         if cert_path is None:
             # Store certs in the package directory
