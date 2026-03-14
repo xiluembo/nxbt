@@ -1,8 +1,9 @@
+import json
 import os
 import time
 import psutil
 from collections import deque
-import multiprocessing
+from threading import Event, Lock, Thread
 from sys import exit
 
 from blessed import Terminal
@@ -321,14 +322,17 @@ class InputTUI:
         """
 
         remote_connection = False
-        remote_process_names = ["sshd", "mosh-server"]
+        remote_process_names = {"sshd", "mosh-server"}
         ppid = os.getppid()
         while ppid > 0:
-            process = psutil.Process(ppid)
-            if process.name() in remote_process_names:
-                remote_connection = True
+            try:
+                process = psutil.Process(ppid)
+                if process.name().lower() in remote_process_names:
+                    remote_connection = True
+                    break
+                ppid = process.ppid()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 break
-            ppid = process.ppid()
 
         return remote_connection
 
@@ -462,11 +466,9 @@ class InputTUI:
         self.exit_tui = False
         self.capture_input = True
 
-        # Create a packet that is accessible from a multiprocessing Process
-        # and from within threads
-        packet_manager = multiprocessing.Manager()
-        input_packet = packet_manager.dict()
-        input_packet["packet"] = self.nx.create_input_packet()
+        input_packet = {"packet": self.nx.create_input_packet()}
+        input_packet_lock = Lock()
+        input_worker_stop = Event()
 
         print(term.move_y(term.height - 5))
         print(
@@ -488,18 +490,19 @@ class InputTUI:
             else:
                 try:
                     control_data = self.KEYMAP[pressed_key]
-                    packet = input_packet["packet"]
-                    if (
-                        type(control_data) == dict
-                        and "stick_data" in control_data.keys()
-                    ):
-                        stick_name = control_data["stick_data"]["stick_name"]
-                        self.controller.activate_control(control_data["control"])
-                        packet[stick_name][control_data["control"]] = True
-                    else:
-                        self.controller.activate_control(control_data)
-                        packet[control_data] = True
-                    input_packet["packet"] = packet
+                    with input_packet_lock:
+                        packet = input_packet["packet"]
+                        if (
+                            type(control_data) == dict
+                            and "stick_data" in control_data.keys()
+                        ):
+                            stick_name = control_data["stick_data"]["stick_name"]
+                            self.controller.activate_control(control_data["control"])
+                            packet[stick_name][control_data["control"]] = True
+                        else:
+                            self.controller.activate_control(control_data)
+                            packet[control_data] = True
+                        input_packet["packet"] = packet
                 except KeyError:
                     pass
 
@@ -525,24 +528,28 @@ class InputTUI:
             else:
                 try:
                     control_data = self.KEYMAP[released_key]
-                    packet = input_packet["packet"]
-                    if (
-                        type(control_data) == dict
-                        and "stick_data" in control_data.keys()
-                    ):
-                        stick_name = control_data["stick_data"]["stick_name"]
-                        self.controller.deactivate_control(control_data["control"])
-                        packet[stick_name][control_data["control"]] = False
-                    else:
-                        self.controller.deactivate_control(control_data)
-                        packet[control_data] = False
-                    input_packet["packet"] = packet
+                    with input_packet_lock:
+                        packet = input_packet["packet"]
+                        if (
+                            type(control_data) == dict
+                            and "stick_data" in control_data.keys()
+                        ):
+                            stick_name = control_data["stick_data"]["stick_name"]
+                            self.controller.deactivate_control(control_data["control"])
+                            packet[stick_name][control_data["control"]] = False
+                        else:
+                            self.controller.deactivate_control(control_data)
+                            packet[control_data] = False
+                        input_packet["packet"] = packet
                 except KeyError:
                     pass
 
-        def input_worker(nxbt, controller_index, input_packet):
-            while True:
-                packet = input_packet["packet"]
+        def input_worker():
+            while not input_worker_stop.is_set():
+                with input_packet_lock:
+                    # Snapshot the current input state so the worker thread
+                    # can calculate stick axes without racing with key events.
+                    packet = json.loads(json.dumps(input_packet["packet"]))
 
                 # Calculating left x/y stick values
                 ls_x_value = 0
@@ -572,13 +579,14 @@ class InputTUI:
                 packet["R_STICK"]["X_VALUE"] = rs_x_value
                 packet["R_STICK"]["Y_VALUE"] = rs_y_value
 
-                nxbt.set_controller_input(controller_index, packet)
+                self.nx.set_controller_input(self.controller_index, packet)
                 time.sleep(1 / 120)
 
-        input_process = multiprocessing.Process(
-            target=input_worker, args=(self.nx, self.controller_index, input_packet)
+        input_thread = Thread(
+            target=input_worker,
+            daemon=True,
         )
-        input_process.start()
+        input_thread.start()
 
         # Start a non-blocking keyboard event listener
         listener = keyboard.Listener(on_press=on_press, on_release=on_release)
@@ -587,8 +595,9 @@ class InputTUI:
         # Main TUI Loop
         while True:
             if self.exit_tui:
-                packet_manager.shutdown()
-                input_process.terminate()
+                input_worker_stop.set()
+                listener.stop()
+                input_thread.join(timeout=1)
                 break
             if not self.capture_input:
                 print(term.home + term.move_y((term.height // 2) - 4))

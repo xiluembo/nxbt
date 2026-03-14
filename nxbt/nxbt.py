@@ -7,15 +7,11 @@ import os
 import sys
 import time
 import json
+from threading import Lock as ThreadLock, Thread
 
-import dbus
-
-from .controller import ControllerServer
 from .controller import ControllerTypes
-from .bluez import BlueZ, find_objects, toggle_clean_bluez
-from .bluez import replace_mac_addresses
-from .bluez import find_devices_by_alias
-from .bluez import SERVICE_NAME, ADAPTER_INTERFACE
+from .controller.server import ControllerServer, run_controller_server
+from .backend import get_backend, resolve_backend_name
 from .logging import create_logger
 
 
@@ -135,7 +131,13 @@ class Nxbt:
     This allows for thread-safe control of emulated controllers.
     """
 
-    def __init__(self, debug=False, log_to_file=False, disable_logging=False):
+    def __init__(
+        self,
+        debug=False,
+        log_to_file=False,
+        disable_logging=False,
+        backend=None,
+    ):
         """Initializes the necessary multiprocessing resources and starts
         the multiprocessing processes.
 
@@ -150,47 +152,67 @@ class Nxbt:
         """
 
         self.debug = debug
+        self.backend_name = resolve_backend_name(backend)
+        self.backend = get_backend(self.backend_name)
+        self.execution_mode = getattr(self.backend, "execution_mode", "process")
+        self.backend.validate_runtime()
         self.logger = create_logger(
             debug=self.debug, log_to_file=log_to_file, disable_logging=disable_logging
         )
 
         # Main queue for nbxt tasks
-        self.task_queue = Queue()
+        if self.execution_mode == "thread":
+            self.task_queue = queue.Queue()
+            self._bluetooth_lock = ThreadLock()
+            self.resource_manager = None
+            self.manager_state = {}
+            self.manager_state_lock = ThreadLock()
+            self._controller_lock = ThreadLock()
+        else:
+            self.task_queue = Queue()
+            self._bluetooth_lock = Lock()
+            self.resource_manager = Manager()
+            # Shared dictionary for viewing overall nxbt state.
+            # Should treated as read-only except by
+            # the main nxbt multiprocessing process.
+            self.manager_state = self.resource_manager.dict()
+            self.manager_state_lock = Lock()
+            self._controller_lock = Lock()
 
-        # Sychronizes bluetooth actions
-        self._bluetooth_lock = Lock()
-
-        # Creates/manages shared resources
-        self.resource_manager = Manager()
-        # Shared dictionary for viewing overall nxbt state.
-        # Should treated as read-only except by
-        # the main nxbt multiprocessing process.
-        self.manager_state = self.resource_manager.dict()
-        self.manager_state_lock = Lock()
-
-        # Shared, controller management properties.
-        # The controller lock is used to sychronize use.
-        self._controller_lock = Lock()
         self._controller_counter = 0
         self._adapters_in_use = {}
         self._controller_adapter_lookup = {}
 
         # Disable the BlueZ input plugin so we can use the
         # HID control/interrupt Bluetooth ports
-        toggle_clean_bluez(True)
+        self.backend.setup()
 
         # Exit handler
         atexit.register(self._on_exit)
 
-        # Starting the nxbt worker process
-        self.controllers = Process(
-            target=self._command_manager,
-            args=((self.task_queue), (self.manager_state), (self._bluetooth_lock)),
+        controller_target = self._command_manager
+        controller_args = (
+            self.task_queue,
+            self.manager_state,
+            self._bluetooth_lock,
+            self.backend_name,
+            self.execution_mode,
         )
-        # Disabling daemonization since we need to spawn
-        # other controller processes, however, this means
-        # we need to cleanup on exit.
-        self.controllers.daemon = False
+        if self.execution_mode == "thread":
+            self.controllers = Thread(
+                target=controller_target,
+                args=controller_args,
+                daemon=True,
+            )
+        else:
+            self.controllers = Process(
+                target=controller_target,
+                args=controller_args,
+            )
+            # Disabling daemonization since we need to spawn
+            # other controller processes, however, this means
+            # we need to cleanup on exit.
+            self.controllers.daemon = False
         self.controllers.start()
 
     def _on_exit(self):
@@ -200,18 +222,31 @@ class Nxbt:
         ensure no zombie processes linger after exit.
         """
 
-        # Need to explicitly kill the controllers process
-        # since it isn't daemonized.
         if hasattr(self, "controllers") and self.controllers.is_alive():
-            self.controllers.terminate()
+            if self.execution_mode == "thread":
+                try:
+                    self.task_queue.put(
+                        {
+                            "command": NxbtCommands.QUIT,
+                            "arguments": {},
+                        }
+                    )
+                    self.controllers.join(timeout=5)
+                except Exception:
+                    pass
+            else:
+                self.controllers.terminate()
 
-        self.resource_manager.shutdown()
+        if self.resource_manager is not None:
+            self.resource_manager.shutdown()
 
         # Re-enable the BlueZ plugins, if we have permission
-        toggle_clean_bluez(False)
+        self.backend.cleanup()
 
     @staticmethod
-    def _command_manager(task_queue, state, bluetooth_lock):
+    def _command_manager(
+        task_queue, state, bluetooth_lock, backend_name, execution_mode="process"
+    ):
         """Used as the main multiprocessing Process that is launched
         on startup to handle the message passing and instantiation of
         the controllers. Messages are pulled out of a Queue and passed
@@ -225,10 +260,16 @@ class Nxbt:
         :type state: multiprocessing.Manager().dict
         """
 
-        cm = _ControllerManager(state, bluetooth_lock)
+        cm = _ControllerManager(
+            state,
+            bluetooth_lock,
+            backend_name,
+            execution_mode=execution_mode,
+        )
         # Ensure a SystemExit exception is raised on SIGTERM
         # so that we can gracefully shutdown.
-        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+        if execution_mode != "thread":
+            signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
 
         try:
             while True:
@@ -264,10 +305,13 @@ class Nxbt:
                         index = msg["arguments"]["controller_index"]
                         cm.clear_macros(index)
                         cm.remove_controller(index)
+                    elif msg["command"] == NxbtCommands.QUIT:
+                        break
 
         finally:
             cm.shutdown()
-            sys.exit(0)
+            if execution_mode != "thread":
+                sys.exit(0)
 
     def macro(self, controller_index, macro, block=True):
         """Used to input a given macro on a specified controller.
@@ -665,11 +709,7 @@ class Nxbt:
         :rtype: list
         """
 
-        bus = dbus.SystemBus()
-        adapters = find_objects(bus, SERVICE_NAME, ADAPTER_INTERFACE)
-        bus.close()
-
-        return adapters
+        return self.backend.get_available_adapters()
 
     def get_switch_addresses(self):
         """Gets the Bluetooth MAC addresses of all
@@ -679,7 +719,10 @@ class Nxbt:
         :rtype: list
         """
 
-        return find_devices_by_alias("Nintendo Switch")
+        return self.backend.get_switch_addresses()
+
+    def get_backend_status(self):
+        return self.backend.get_status()
 
     @property
     def state(self):
@@ -723,12 +766,15 @@ class _ControllerManager:
     or macro clearing/stopping.
     """
 
-    def __init__(self, state, lock):
+    def __init__(self, state, lock, backend_name, execution_mode="process"):
         self.state = state
         self.lock = lock
-        self.controller_resources = Manager()
+        self.backend_name = backend_name
+        self.execution_mode = execution_mode
+        self.controller_resources = None if execution_mode == "thread" else Manager()
         self._controller_queues = {}
         self._children = {}
+        self._servers = {}
 
     def create_controller(
         self,
@@ -762,34 +808,71 @@ class _ControllerManager:
         :type reconnect_address: str, optional
         """
 
-        controller_queue = Queue()
-
-        controller_state = self.controller_resources.dict()
-        controller_state["state"] = "initializing"
-        controller_state["finished_macros"] = []
-        controller_state["errors"] = False
-        controller_state["direct_input"] = json.loads(json.dumps(DIRECT_INPUT_PACKET))
-        controller_state["colour_body"] = colour_body
-        controller_state["colour_buttons"] = colour_buttons
-        controller_state["type"] = str(controller_type)
-        controller_state["adapter_path"] = adapter_path
-        controller_state["last_connection"] = None
+        if self.execution_mode == "thread":
+            controller_queue = queue.Queue()
+            controller_state = {
+                "state": "initializing",
+                "finished_macros": [],
+                "errors": False,
+                "direct_input": json.loads(json.dumps(DIRECT_INPUT_PACKET)),
+                "colour_body": colour_body,
+                "colour_buttons": colour_buttons,
+                "type": str(controller_type),
+                "adapter_path": adapter_path,
+                "last_connection": None,
+            }
+        else:
+            controller_queue = Queue()
+            controller_state = self.controller_resources.dict()
+            controller_state["state"] = "initializing"
+            controller_state["finished_macros"] = []
+            controller_state["errors"] = False
+            controller_state["direct_input"] = json.loads(
+                json.dumps(DIRECT_INPUT_PACKET)
+            )
+            controller_state["colour_body"] = colour_body
+            controller_state["colour_buttons"] = colour_buttons
+            controller_state["type"] = str(controller_type)
+            controller_state["adapter_path"] = adapter_path
+            controller_state["last_connection"] = None
 
         self._controller_queues[index] = controller_queue
 
         self.state[index] = controller_state
 
-        server = ControllerServer(
-            controller_type,
-            adapter_path=adapter_path,
-            lock=self.lock,
-            state=controller_state,
-            task_queue=controller_queue,
-            colour_body=colour_body,
-            colour_buttons=colour_buttons,
-        )
-        controller = Process(target=server.run, args=(reconnect_address,))
-        controller.daemon = True
+        if self.execution_mode == "thread":
+            server = ControllerServer(
+                controller_type,
+                adapter_path=adapter_path,
+                state=controller_state,
+                task_queue=controller_queue,
+                lock=self.lock,
+                colour_body=colour_body,
+                colour_buttons=colour_buttons,
+                backend_name=self.backend_name,
+            )
+            controller = Thread(
+                target=server.run,
+                args=(reconnect_address,),
+                daemon=True,
+            )
+            self._servers[index] = server
+        else:
+            controller = Process(
+                target=run_controller_server,
+                args=(
+                    controller_type,
+                    adapter_path,
+                    controller_state,
+                    controller_queue,
+                    self.lock,
+                    colour_body,
+                    colour_buttons,
+                    self.backend_name,
+                    reconnect_address,
+                ),
+            )
+            controller.daemon = True
         self._children[index] = controller
         controller.start()
 
@@ -814,13 +897,29 @@ class _ControllerManager:
         )
 
     def remove_controller(self, index):
-        self._children[index].terminate()
+        if self.execution_mode == "thread":
+            server = self._servers.pop(index, None)
+            if server is not None:
+                server.request_shutdown()
+            child = self._children[index]
+            child.join(timeout=5)
+        else:
+            self._children[index].terminate()
+        self._children.pop(index, None)
         self.state.pop(index, None)
 
     def shutdown(self):
         # Loop over children and kill all
-        for index in self._children.keys():
-            child = self._children[index]
-            child.terminate()
+        for index in list(self._children.keys()):
+            if self.execution_mode == "thread":
+                server = self._servers.pop(index, None)
+                if server is not None:
+                    server.request_shutdown()
+                child = self._children.pop(index)
+                child.join(timeout=5)
+            else:
+                child = self._children[index]
+                child.terminate()
 
-        self.controller_resources.shutdown()
+        if self.controller_resources is not None:
+            self.controller_resources.shutdown()

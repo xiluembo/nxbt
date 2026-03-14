@@ -10,7 +10,11 @@ from ..utils import load_file
 from ..nxbt import Nxbt, PRO_CONTROLLER
 from flask import Flask, render_template, request
 from flask_socketio import SocketIO, emit
-import eventlet
+
+try:
+    import eventlet
+except ImportError:  # pragma: no cover - depends on optional runtime
+    eventlet = None
 
 app = Flask(__name__,
             static_url_path='',
@@ -147,10 +151,28 @@ def start_web_app(ip='0.0.0.0', port=8000, usessl=False, cert_path=None):
             with open(key_path, "wb") as f:
                 f.write(key)
 
-        eventlet.wsgi.server(eventlet.wrap_ssl(eventlet.listen((ip, port)),
-            certfile=cert_path, keyfile=key_path), app)
+        if eventlet is not None and sys.platform != "win32":
+            eventlet.wsgi.server(
+                eventlet.wrap_ssl(
+                    eventlet.listen((ip, port)),
+                    certfile=cert_path,
+                    keyfile=key_path,
+                ),
+                app,
+            )
+        else:
+            sio.run(
+                app,
+                host=ip,
+                port=port,
+                ssl_context=(cert_path, key_path),
+                allow_unsafe_werkzeug=True,
+            )
     else:
-        eventlet.wsgi.server(eventlet.listen((ip, port)), app)
+        if eventlet is not None and sys.platform != "win32":
+            eventlet.wsgi.server(eventlet.listen((ip, port)), app)
+        else:
+            sio.run(app, host=ip, port=port, allow_unsafe_werkzeug=True)
 
 
 if __name__ == "__main__":

@@ -6,8 +6,7 @@ import traceback
 from sys import exit
 
 from .nxbt import Nxbt, PRO_CONTROLLER
-from .bluez import find_devices_by_alias
-from .tui import InputTUI
+from .backend import BACKEND_ENV_VAR, BackendUnavailableError, get_backend
 
 
 parser = argparse.ArgumentParser()
@@ -29,6 +28,7 @@ parser.add_argument(
                     test - Runs through a series of tests to ensure NXBT is working and
                     compatible with your system.""",
 )
+connection_group = parser.add_mutually_exclusive_group()
 parser.add_argument(
     "-c",
     "--commands",
@@ -37,23 +37,23 @@ parser.add_argument(
     help="""Used in conjunction with the macro command. Specifies a
                     macro string or a file location to load a macro string from.""",
 )
-parser.add_argument(
+connection_group.add_argument(
     "-r",
     "--reconnect",
     required=False,
     default=False,
     action="store_true",
     help="""Used in conjunction with the macro or tui command. If specified,
-                    nxbt will attmept to reconnect to any previously connected
+                    nxbt will attempt to reconnect to any previously connected
                     Nintendo Switch.""",
 )
-parser.add_argument(
+connection_group.add_argument(
     "-a",
     "--address",
     required=False,
     default=False,
     help="""Used in conjunction with the macro or tui command. If specified,
-                    nxbt will attmept to reconnect to a specific Bluetooth MAC address
+                    nxbt will attempt to reconnect to a specific Bluetooth MAC address
                     of a Nintendo Switch.""",
 )
 parser.add_argument(
@@ -105,7 +105,8 @@ parser.add_argument(
                     in the webapp. Certificates in this folder should be in the form of
                     a 'cert.pem' and 'key.pem' pair.""",
 )
-args = parser.parse_args()
+args = None
+TUI_IMPORT_DEPENDENCIES = {"blessed", "psutil"}
 
 
 MACRO = """
@@ -161,7 +162,7 @@ A 0.1s
 
 
 def random_colour():
-    return [
+        return [
         randint(0, 255),
         randint(0, 255),
         randint(0, 255),
@@ -181,15 +182,48 @@ def check_bluetooth_address(address):
         raise ValueError("Invalid Bluetooth address")
 
 
-def get_reconnect_target():
-    if args.reconnect:
-        reconnect_target = find_devices_by_alias("Nintendo Switch")
-    elif args.address:
-        check_bluetooth_address(args.address)
-        reconnect_target = args.address
-    else:
-        reconnect_target = None
+def resolve_reconnect_target(cli_args, addresses):
+    if cli_args.address:
+        check_bluetooth_address(cli_args.address)
+        return cli_args.address, f"Reconnecting to saved Switch at {cli_args.address}."
 
+    if cli_args.reconnect:
+        if not addresses:
+            return (
+                None,
+                "No saved Switch addresses were found. Waiting for a new pairing connection.",
+            )
+        return addresses, "Reconnecting to previously paired Switch address(es)."
+
+    if not addresses:
+        return None, None
+
+    if len(addresses) == 1:
+        return (
+            addresses[0],
+            (
+                f"Using the only saved Switch address ({addresses[0]}). "
+                "Use --address to target a different saved Switch."
+            ),
+        )
+
+    return (
+        addresses,
+        (
+            "Using all saved Switch addresses for reconnect attempts. "
+            "Use --address to target one saved Switch explicitly."
+        ),
+    )
+
+
+def get_reconnect_target():
+    cli_args = parsed_args()
+    backend = get_backend()
+    reconnect_target, message = resolve_reconnect_target(
+        cli_args, backend.get_switch_addresses()
+    )
+    if message:
+        print(message)
     return reconnect_target
 
 
@@ -199,7 +233,8 @@ def demo():
     is used to run a macro.
     """
 
-    nx = Nxbt(debug=args.debug, log_to_file=args.logfile)
+    cli_args = parsed_args()
+    nx = Nxbt(debug=cli_args.debug, log_to_file=cli_args.logfile)
     adapters = nx.get_available_adapters()
     if len(adapters) < 1:
         raise OSError("Unable to detect any Bluetooth adapters.")
@@ -230,11 +265,27 @@ def demo():
 
 def test():
     """Tests NXBT functionality"""
+    cli_args = parsed_args()
+    backend = get_backend()
+    status = backend.get_status()
+    print("[0] Selected backend:", status["name"])
+    print(status["message"], "\n")
+    try:
+        backend.validate_runtime()
+    except BackendUnavailableError as exc:
+        print("Backend unavailable:")
+        print(exc)
+        return
+    if not status.get("controller_transport_ready", True):
+        print("Backend implementation pending:")
+        print("controller transport wiring is not implemented yet.")
+        return
+
     # Init
     print("[1] Attempting to initialize NXBT...")
     nx = None
     try:
-        nx = Nxbt(debug=args.debug, log_to_file=args.logfile)
+        nx = Nxbt(debug=cli_args.debug, log_to_file=cli_args.logfile)
     except Exception as e:
         print("Failed to initialize:")
         print(traceback.format_exc())
@@ -314,13 +365,14 @@ def macro():
     or input from the user in an interactive process.
     """
 
+    cli_args = parsed_args()
     macro = None
-    if args.commands:
-        if os.path.isfile(args.commands):
-            with open(args.commands, "r") as f:
+    if cli_args.commands:
+        if os.path.isfile(cli_args.commands):
+            with open(cli_args.commands, "r") as f:
                 macro = f.read()
         else:
-            macro = args.commands
+            macro = cli_args.commands
     else:
         print("No macro commands were specified.")
         print("Please use the -c argument to specify a macro string or a file location")
@@ -329,7 +381,7 @@ def macro():
 
     reconnect_target = get_reconnect_target()
 
-    nx = Nxbt(debug=args.debug, log_to_file=args.logfile)
+    nx = Nxbt(debug=cli_args.debug, log_to_file=cli_args.logfile)
     print("Creating controller...")
     index = nx.create_controller(
         PRO_CONTROLLER,
@@ -337,7 +389,10 @@ def macro():
         colour_buttons=random_colour(),
         reconnect_address=reconnect_target,
     )
-    print("Waiting for connection...")
+    if reconnect_target:
+        print("Waiting for reconnect...")
+    else:
+        print("Waiting for a new pairing connection...")
     nx.wait_for_connection(index)
     print("Connected!")
 
@@ -355,7 +410,13 @@ def macro():
 
 
 def list_switch_addresses():
-    addresses = find_devices_by_alias("Nintendo Switch")
+    backend = get_backend()
+    try:
+        addresses = backend.get_switch_addresses()
+    except BackendUnavailableError as exc:
+        print(exc)
+        print(f"Override the backend with {BACKEND_ENV_VAR} if needed.")
+        return
 
     if not addresses or len(addresses) < 1:
         print("No Switches have previously connected to this device.")
@@ -370,26 +431,49 @@ def list_switch_addresses():
     print("---------------------------")
 
 
+def _start_tui(force_remote=False):
+    try:
+        from .tui import InputTUI
+    except ModuleNotFoundError as exc:
+        if exc.name in TUI_IMPORT_DEPENDENCIES:
+            print("The TUI dependencies are not installed.")
+            print("Install nxbt's terminal dependencies and try again.")
+            print("Suggested command:")
+            print("python -m pip install blessed==1.17.10 psutil pynput==1.7.1")
+            return
+        raise
+
+    reconnect_target = get_reconnect_target()
+    tui = InputTUI(reconnect_target=reconnect_target, force_remote=force_remote)
+    tui.start()
+
+
 def main():
-    if args.command == "webapp":
+    cli_args = parsed_args()
+
+    if cli_args.command == "webapp":
         from .web import start_web_app
 
         start_web_app(
-            ip=args.ip, port=args.port, usessl=args.usessl, cert_path=args.certpath
+            ip=cli_args.ip,
+            port=cli_args.port,
+            usessl=cli_args.usessl,
+            cert_path=cli_args.certpath,
         )
-    elif args.command == "demo":
+    elif cli_args.command == "demo":
         demo()
-    elif args.command == "macro":
+    elif cli_args.command == "macro":
         macro()
-    elif args.command == "tui":
-        reconnect_target = get_reconnect_target()
-        tui = InputTUI(reconnect_target=reconnect_target)
-        tui.start()
-    elif args.command == "remote_tui":
-        reconnect_target = get_reconnect_target()
-        tui = InputTUI(reconnect_target=reconnect_target, force_remote=True)
-        tui.start()
-    elif args.command == "addresses":
+    elif cli_args.command == "tui":
+        _start_tui()
+    elif cli_args.command == "remote_tui":
+        _start_tui(force_remote=True)
+    elif cli_args.command == "addresses":
         list_switch_addresses()
-    elif args.command == "test":
+    elif cli_args.command == "test":
         test()
+def parsed_args():
+    global args
+    if args is None:
+        args = parser.parse_args()
+    return args

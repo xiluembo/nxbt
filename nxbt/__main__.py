@@ -12,6 +12,19 @@
 # nuitka-project: --include-data-dir=./nxbt/controller/sdp=nxbt/controller/sdp
 # nuitka-project: --remove-output
 
+import sys
+from pathlib import Path
+
+
+if __package__ in (None, ""):
+    package_dir = Path(__file__).resolve().parent
+    project_root = str(package_dir.parent)
+    package_dir_str = str(package_dir)
+
+    if sys.path and sys.path[0] == package_dir_str:
+        sys.path.pop(0)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
 
 from nxbt.cli import main
 

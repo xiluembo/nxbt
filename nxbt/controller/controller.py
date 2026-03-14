@@ -1,10 +1,7 @@
 import logging
-import os
-import sys
 from enum import Enum
 
 from ..utils import load_file
-import dbus
 
 
 class ControllerTypes(Enum):
@@ -62,5 +59,5 @@ class Controller:
         # catch the error and continue
         try:
             self.bt.register_profile(self.SDP_RECORD_PATH, self.SDP_UUID, opts)
-        except dbus.exceptions.DBusException as e:
+        except Exception as e:
             self.logger.debug(e)

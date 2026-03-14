@@ -23,13 +23,13 @@ classifiers = [
 ]
 requires-python = ">=3.9"
 dependencies = [
-    "dbus-python==1.3.2",
+    "dbus-python==1.3.2; platform_system == 'Linux'",
     "Flask==3.1.0",
     "Flask-SocketIO==5.3.4",
     "eventlet==0.40.3",
     "blessed==1.17.10",
     "pynput==1.7.1",
-    "psutil==5.6.6",
+    "psutil==5.9.8",
     "cryptography==3.3.2",
     "jinja2==3.1.2",
     "itsdangerous==2.2",
@@ -39,6 +39,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest"
+]
+windows = [
+    "bumble"
 ]
 
 [project.urls]
