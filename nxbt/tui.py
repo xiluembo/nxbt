@@ -339,6 +339,21 @@ class InputTUI:
     def start(self):
         self.mainloop(self.term)
 
+    def shutdown(self):
+        controller_index = getattr(self, "controller_index", None)
+        if hasattr(self, "nx"):
+            if controller_index is not None:
+                try:
+                    self.nx.remove_controller(controller_index)
+                except Exception:
+                    pass
+                finally:
+                    self.controller_index = None
+            try:
+                self.nx._on_exit()
+            except Exception:
+                pass
+
     def mainloop(self, term):
         # Initializing a controller
         if not self.debug:
@@ -403,6 +418,7 @@ class InputTUI:
         except KeyboardInterrupt:
             pass
         finally:
+            self.shutdown()
             print(term.clear())
             if errors:
                 print("The TUI encountered the following errors:")
