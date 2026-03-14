@@ -41,7 +41,7 @@ dev = [
     "pytest"
 ]
 windows = [
-    "bumble"
+    "bumble==0.0.226"
 ]
 
 [project.urls]
