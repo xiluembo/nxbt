@@ -588,32 +588,43 @@ class InputTUI:
         )
         input_thread.start()
 
-        # Start a non-blocking keyboard event listener
-        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        # Start a non-blocking keyboard event listener. Suppressing the
+        # underlying events prevents the focused shell from buffering the same
+        # keystrokes that are being used as controller input.
+        listener = keyboard.Listener(
+            on_press=on_press,
+            on_release=on_release,
+            suppress=True,
+        )
         listener.start()
 
-        # Main TUI Loop
-        while True:
-            if self.exit_tui:
-                input_worker_stop.set()
-                listener.stop()
-                input_thread.join(timeout=1)
-                break
-            if not self.capture_input:
-                print(term.home + term.move_y((term.height // 2) - 4))
-                print(term.bold_black_on_white(term.center("")))
-                print(
-                    term.bold_black_on_white(
-                        term.center(
-                            "<Input Paused. Press ESC Again to Begin Capturing Input>"
+        try:
+            # Main TUI Loop
+            while True:
+                if self.exit_tui:
+                    break
+                if not self.capture_input:
+                    print(term.home + term.move_y((term.height // 2) - 4))
+                    print(term.bold_black_on_white(term.center("")))
+                    print(
+                        term.bold_black_on_white(
+                            term.center(
+                                "<Input Paused. Press ESC Again to Begin Capturing Input>"
+                            )
                         )
                     )
-                )
-                print(term.bold_black_on_white(term.center("")))
-            else:
-                self.controller.render_controller()
-            self.check_for_disconnect(term)
-            time.sleep(1 / 120)
+                    print(term.bold_black_on_white(term.center("")))
+                else:
+                    self.controller.render_controller()
+                self.check_for_disconnect(term)
+                time.sleep(1 / 120)
+        finally:
+            input_worker_stop.set()
+            listener.stop()
+            listener.join(1)
+            input_thread.join(1)
+            while term.inkey(timeout=0):
+                pass
 
     def render_start_screen(self, term, loading_text):
         print(term.home + term.move_y((term.height // 2) - 8))
