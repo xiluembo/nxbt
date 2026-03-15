@@ -4,12 +4,12 @@ from dataclasses import replace
 
 from ..models import InputProvider
 from .keyboard import KEYBOARD_PROVIDER_ID, KeyboardInputBackend
-from .pygame import PygameGamepadBackend
+from .sdl3 import Sdl3GamepadBackend
 
 
 class InputBackendManager:
     def __init__(self, backends=None):
-        self.backends = list(backends or [KeyboardInputBackend(), PygameGamepadBackend()])
+        self.backends = list(backends or [KeyboardInputBackend(), Sdl3GamepadBackend()])
         self._controller_provider_map: dict[int, str] = {}
         self._provider_controller_map: dict[str, int] = {}
         self._known_providers: dict[str, InputProvider] = {}

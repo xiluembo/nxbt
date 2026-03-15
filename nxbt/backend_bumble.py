@@ -62,6 +62,40 @@ def _address_to_string(address: Any) -> str:
     return str(address).split("/", 1)[0]
 
 
+def _iter_exception_chain(exc: BaseException):
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        yield current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+
+
+def _is_page_timeout_error(exc: BaseException) -> bool:
+    for candidate in _iter_exception_chain(exc):
+        error_name = getattr(candidate, "error_name", "")
+        if error_name == "PAGE_TIMEOUT_ERROR":
+            return True
+        if "PAGE_TIMEOUT_ERROR" in str(candidate):
+            return True
+    return False
+
+
+def _build_reconnect_error(reconnect_address, last_error: BaseException) -> OSError:
+    if _is_page_timeout_error(last_error):
+        message = (
+            "Unable to reconnect to the saved Switch because it did not answer "
+            "the Bluetooth page request. Wake the Switch and keep it on the "
+            "Home screen before retrying."
+        )
+        return OSError(message, reconnect_address)
+
+    return OSError(
+        "Unable to reconnect to sockets at the given address(es)",
+        reconnect_address,
+    )
+
+
 def _load_bumble_modules() -> dict[str, Any]:
     try:
         device = importlib.import_module("bumble.device")
@@ -715,10 +749,7 @@ class BumbleControllerAdapter:
             except Exception as exc:
                 last_error = exc
 
-        raise OSError(
-            "Unable to reconnect to sockets at the given address(es)",
-            reconnect_address,
-        ) from last_error
+        raise _build_reconnect_error(reconnect_address, last_error) from last_error
 
     def set_nonblocking(self, sock) -> None:
         sock.setblocking(False)

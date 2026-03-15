@@ -14,6 +14,8 @@ class InputProvider:
     backend_id: str
     provider_id: str
     display_name: str
+    profile_label: str = ""
+    details: str = ""
     is_available: bool = True
 
 

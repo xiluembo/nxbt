@@ -18,4 +18,4 @@ bumble==0.0.226; platform_system == "Windows"
 
 # Desktop UI
 PyQt6>=6.7,<7
-pygame>=2.6,<3
+PySDL3==0.9.10b0

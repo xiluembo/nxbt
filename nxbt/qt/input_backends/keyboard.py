@@ -50,6 +50,8 @@ class KeyboardInputBackend(BaseInputBackend):
                 backend_id=self.backend_id,
                 provider_id=KEYBOARD_PROVIDER_ID,
                 display_name="Keyboard",
+                profile_label="Keyboard",
+                details="Detected input type: Keyboard.",
             )
         ]
 

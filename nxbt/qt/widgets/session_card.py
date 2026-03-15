@@ -155,11 +155,15 @@ class SessionCard(QWidget):
             self.macro_status.setText("Direct input overrides macros while active.")
 
     def set_provider_choices(self, providers, assigned_provider_id):
+        provider_map = {provider.provider_id: provider for provider in providers}
         self.input_combo.blockSignals(True)
         self.input_combo.clear()
         self.input_combo.addItem("No Input Provider", None)
         for provider in providers:
-            self.input_combo.addItem(provider.display_name, provider.provider_id)
+            label = provider.display_name
+            if provider.profile_label:
+                label = f"{label} [{provider.profile_label}]"
+            self.input_combo.addItem(label, provider.provider_id)
         index = self.input_combo.findData(assigned_provider_id)
         self.input_combo.setCurrentIndex(max(index, 0))
         self.input_combo.blockSignals(False)
@@ -169,7 +173,13 @@ class SessionCard(QWidget):
                 "Assign a unique keyboard or gamepad provider."
             )
         else:
-            self.provider_note.setText("This input provider is reserved for this controller.")
+            provider = provider_map.get(assigned_provider_id)
+            if provider is not None and provider.details:
+                self.provider_note.setText(provider.details)
+            else:
+                self.provider_note.setText(
+                    "This input provider is reserved for this controller."
+                )
 
     def _emit_provider_changed(self) -> None:
         provider_id = self.input_combo.currentData()

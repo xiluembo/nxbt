@@ -1,4 +1,7 @@
+import os
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from nxbt.qt.controller_manager import ControllerManager
 from nxbt.qt.input_backends.base import BaseInputBackend
@@ -101,33 +104,94 @@ class FakeProviderBackend(BaseInputBackend):
         return packets
 
 
-class FakeJoystick:
-    def __init__(self, *, name, axes, buttons, hats):
-        self._name = name
-        self._axes = axes
-        self._buttons = buttons
-        self._hats = hats
+class FakeSdl3Gamepad:
+    def __init__(self, *, instance_id, name, axes=None, buttons=None, connected=True):
+        self.instance_id = instance_id
+        self.name = name
+        self.axes = dict(axes or {})
+        self.buttons = dict(buttons or {})
+        self.connected = connected
 
-    def get_name(self):
-        return self._name
 
-    def get_numaxes(self):
-        return len(self._axes)
+class FakeSdl3Module:
+    SDL_INIT_GAMEPAD = 0x00002000
+    SDL_INIT_EVENTS = 0x00004000
 
-    def get_axis(self, index):
-        return self._axes[index]
+    SDL_GAMEPAD_AXIS_LEFTX = 0
+    SDL_GAMEPAD_AXIS_LEFTY = 1
+    SDL_GAMEPAD_AXIS_RIGHTX = 2
+    SDL_GAMEPAD_AXIS_RIGHTY = 3
+    SDL_GAMEPAD_AXIS_LEFT_TRIGGER = 4
+    SDL_GAMEPAD_AXIS_RIGHT_TRIGGER = 5
 
-    def get_numbuttons(self):
-        return len(self._buttons)
+    SDL_GAMEPAD_BUTTON_SOUTH = 0
+    SDL_GAMEPAD_BUTTON_EAST = 1
+    SDL_GAMEPAD_BUTTON_WEST = 2
+    SDL_GAMEPAD_BUTTON_NORTH = 3
+    SDL_GAMEPAD_BUTTON_BACK = 4
+    SDL_GAMEPAD_BUTTON_GUIDE = 5
+    SDL_GAMEPAD_BUTTON_START = 6
+    SDL_GAMEPAD_BUTTON_LEFT_STICK = 7
+    SDL_GAMEPAD_BUTTON_RIGHT_STICK = 8
+    SDL_GAMEPAD_BUTTON_LEFT_SHOULDER = 9
+    SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER = 10
+    SDL_GAMEPAD_BUTTON_DPAD_UP = 11
+    SDL_GAMEPAD_BUTTON_DPAD_DOWN = 12
+    SDL_GAMEPAD_BUTTON_DPAD_LEFT = 13
+    SDL_GAMEPAD_BUTTON_DPAD_RIGHT = 14
+    SDL_GAMEPAD_BUTTON_MISC1 = 15
+    SDL_GAMEPAD_BUTTON_TOUCHPAD = 21
 
-    def get_button(self, index):
-        return self._buttons[index]
+    def __init__(self, gamepads):
+        self.gamepads = {gamepad.instance_id: gamepad for gamepad in gamepads}
+        self.closed = []
+        self.init_calls = 0
+        self.quit_calls = 0
 
-    def get_numhats(self):
-        return len(self._hats)
+    def SDL_InitSubSystem(self, _flags):
+        self.init_calls += 1
+        return True
 
-    def get_hat(self, index):
-        return self._hats[index]
+    def SDL_QuitSubSystem(self, _flags):
+        self.quit_calls += 1
+
+    def SDL_GetGamepads(self, count_ptr):
+        count_ptr._obj.value = len(self.gamepads)
+        return list(self.gamepads.keys())
+
+    def SDL_GetGamepadNameForID(self, instance_id):
+        return self.gamepads[int(instance_id)].name.encode("utf-8")
+
+    def SDL_OpenGamepad(self, instance_id):
+        return self.gamepads.get(int(instance_id))
+
+    def SDL_CloseGamepad(self, gamepad):
+        self.closed.append(gamepad.instance_id)
+
+    def SDL_GamepadConnected(self, gamepad):
+        return gamepad.connected
+
+    def SDL_PumpEvents(self):
+        return None
+
+    def SDL_GetGamepadAxis(self, gamepad, axis):
+        return gamepad.axes.get(axis, 0)
+
+    def SDL_GetGamepadButton(self, gamepad, button):
+        return 1 if gamepad.buttons.get(button, False) else 0
+
+    def SDL_GetError(self):
+        return b"fake sdl3 error"
+
+    def SDL_GET_BINARY(self, name):
+        if name == "SDL3":
+            return object()
+        return None
+
+
+class FakeSdl3MissingRuntime(FakeSdl3Module):
+    def SDL_GET_BINARY(self, name):
+        return None
 
 
 class ControllerManagerTests(unittest.TestCase):
@@ -202,122 +266,163 @@ class InputBackendManagerTests(unittest.TestCase):
         self.assertNotIn("pad-1", provider_ids)
         self.assertIn("pad-2", provider_ids)
 
-    def test_pygame_backend_maps_xinput_layout(self):
-        from nxbt.qt.input_backends.pygame import PygameGamepadBackend
+    def test_sdl3_backend_enumerates_gamepads_with_details(self):
+        from nxbt.qt.input_backends.sdl3 import Sdl3GamepadBackend
 
-        backend = PygameGamepadBackend()
-        joystick = FakeJoystick(
-            name="Xbox 360 Controller",
-            axes=[0.25, -0.5, -0.75, 0.4, 0.9, 0.8],
-            buttons=[
-                1,  # B
-                1,  # A
-                0,  # Y
-                0,  # X
-                1,  # L
-                1,  # R
-                1,  # Start / Plus
-                1,  # Select / Minus
-                1,  # L3
-                1,  # R3
-                1,  # Guide / Home
-            ],
-            hats=[(1, -1)],
+        backend = Sdl3GamepadBackend()
+        backend._sdl3 = FakeSdl3Module(
+            [
+                FakeSdl3Gamepad(instance_id=11, name="DualSense"),
+                FakeSdl3Gamepad(instance_id=22, name="Xbox Wireless Controller"),
+            ]
         )
 
-        backend._trigger_axis_modes["gamepad:xinput"] = {4: "unsigned", 5: "unsigned"}
-        packet = backend._read_joystick_packet("gamepad:xinput", joystick)
+        providers = backend.list_providers()
 
+        self.assertEqual(len(providers), 2)
+        self.assertEqual(providers[0].provider_id, "gamepad:11")
+        self.assertEqual(providers[0].profile_label, "SDL3 Gamepad")
+        self.assertIn("Instance ID: 11", providers[0].details)
+
+    def test_sdl3_backend_maps_standard_gamepad_layout(self):
+        from nxbt.qt.input_backends.sdl3 import Sdl3GamepadBackend
+
+        fake_sdl3 = FakeSdl3Module(
+            [
+                FakeSdl3Gamepad(
+                    instance_id=7,
+                    name="DualSense",
+                    axes={
+                        FakeSdl3Module.SDL_GAMEPAD_AXIS_LEFTX: 8192,
+                        FakeSdl3Module.SDL_GAMEPAD_AXIS_LEFTY: -16384,
+                        FakeSdl3Module.SDL_GAMEPAD_AXIS_RIGHTX: -24576,
+                        FakeSdl3Module.SDL_GAMEPAD_AXIS_RIGHTY: 12288,
+                        FakeSdl3Module.SDL_GAMEPAD_AXIS_LEFT_TRIGGER: 20000,
+                        FakeSdl3Module.SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: 22000,
+                    },
+                    buttons={
+                        FakeSdl3Module.SDL_GAMEPAD_BUTTON_SOUTH: True,
+                        FakeSdl3Module.SDL_GAMEPAD_BUTTON_EAST: True,
+                        FakeSdl3Module.SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: True,
+                        FakeSdl3Module.SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: True,
+                        FakeSdl3Module.SDL_GAMEPAD_BUTTON_BACK: True,
+                        FakeSdl3Module.SDL_GAMEPAD_BUTTON_START: True,
+                        FakeSdl3Module.SDL_GAMEPAD_BUTTON_GUIDE: True,
+                        FakeSdl3Module.SDL_GAMEPAD_BUTTON_LEFT_STICK: True,
+                        FakeSdl3Module.SDL_GAMEPAD_BUTTON_RIGHT_STICK: True,
+                        FakeSdl3Module.SDL_GAMEPAD_BUTTON_DPAD_RIGHT: True,
+                        FakeSdl3Module.SDL_GAMEPAD_BUTTON_DPAD_DOWN: True,
+                        FakeSdl3Module.SDL_GAMEPAD_BUTTON_MISC1: True,
+                    },
+                )
+            ]
+        )
+        backend = Sdl3GamepadBackend()
+        backend._sdl3 = fake_sdl3
+
+        providers = backend.list_providers()
+        backend.claim(providers[0].provider_id, 0)
+        packet = backend.poll()[providers[0].provider_id]
+
+        self.assertEqual(packet["L_STICK"]["X_VALUE"], 25)
+        self.assertEqual(packet["L_STICK"]["Y_VALUE"], 50)
+        self.assertEqual(packet["R_STICK"]["X_VALUE"], -75)
+        self.assertEqual(packet["R_STICK"]["Y_VALUE"], -38)
         self.assertTrue(packet["L_STICK"]["PRESSED"])
         self.assertTrue(packet["R_STICK"]["PRESSED"])
+        self.assertTrue(packet["B"])
+        self.assertTrue(packet["A"])
+        self.assertTrue(packet["L"])
+        self.assertTrue(packet["R"])
+        self.assertTrue(packet["ZL"])
+        self.assertTrue(packet["ZR"])
         self.assertTrue(packet["MINUS"])
         self.assertTrue(packet["PLUS"])
         self.assertTrue(packet["HOME"])
-        self.assertTrue(packet["ZL"])
-        self.assertTrue(packet["ZR"])
+        self.assertTrue(packet["CAPTURE"])
         self.assertTrue(packet["DPAD_RIGHT"])
         self.assertTrue(packet["DPAD_DOWN"])
 
-    def test_pygame_backend_keeps_standard_button_layout(self):
-        from nxbt.qt.input_backends.pygame import PygameGamepadBackend
+    def test_sdl3_backend_trigger_threshold_uses_fifty_percent(self):
+        from nxbt.qt.input_backends.sdl3 import Sdl3GamepadBackend
 
-        backend = PygameGamepadBackend()
-        joystick = FakeJoystick(
-            name="Generic USB Gamepad",
-            axes=[0.0, 0.0, 0.0, 0.0],
-            buttons=[
-                0, 0, 0, 0, 0, 0,
-                1,  # ZL
-                1,  # ZR
-                1,  # Plus
-                1,  # Minus
-                1,  # L3
-                1,  # R3
-                0, 0, 0, 0,
-                1,  # Home
-                1,  # Capture
-            ],
-            hats=[],
+        backend = Sdl3GamepadBackend()
+
+        self.assertFalse(backend._trigger_pressed(16383))
+        self.assertTrue(backend._trigger_pressed(16384))
+
+    def test_sdl3_backend_maps_touchpad_click_to_capture(self):
+        from nxbt.qt.input_backends.sdl3 import Sdl3GamepadBackend
+
+        fake_sdl3 = FakeSdl3Module(
+            [
+                FakeSdl3Gamepad(
+                    instance_id=44,
+                    name="DualSense",
+                    buttons={
+                        FakeSdl3Module.SDL_GAMEPAD_BUTTON_TOUCHPAD: True,
+                    },
+                )
+            ]
         )
+        backend = Sdl3GamepadBackend()
+        backend._sdl3 = fake_sdl3
 
-        packet = backend._read_joystick_packet("gamepad:generic", joystick)
+        providers = backend.list_providers()
+        backend.claim(providers[0].provider_id, 0)
+        packet = backend.poll()[providers[0].provider_id]
 
-        self.assertTrue(packet["ZL"])
-        self.assertTrue(packet["ZR"])
-        self.assertTrue(packet["PLUS"])
-        self.assertTrue(packet["MINUS"])
-        self.assertTrue(packet["L_STICK"]["PRESSED"])
-        self.assertTrue(packet["R_STICK"]["PRESSED"])
-        self.assertTrue(packet["HOME"])
         self.assertTrue(packet["CAPTURE"])
 
-    def test_xinput_signed_trigger_threshold_uses_fifty_percent(self):
-        from nxbt.qt.input_backends.pygame import PygameGamepadBackend
+    def test_sdl3_backend_reports_missing_runtime_once(self):
+        from nxbt.qt.input_backends.sdl3 import Sdl3GamepadBackend
 
-        backend = PygameGamepadBackend()
-        joystick = FakeJoystick(
-            name="Xbox 360 Controller",
-            axes=[0.0, 0.0, 0.0, 0.0, -1.0, -1.0],
-            buttons=[0] * 11,
-            hats=[],
+        backend = Sdl3GamepadBackend()
+        backend._sdl3 = FakeSdl3MissingRuntime([])
+
+        self.assertEqual(backend.list_providers(), [])
+        first_error = backend.last_error
+        self.assertIn("no SDL3 runtime library was found", first_error)
+        self.assertEqual(backend.list_providers(), [])
+        self.assertEqual(backend.last_error, first_error)
+
+    def test_sdl3_backend_prefers_local_runtime_directory(self):
+        from nxbt.qt.input_backends.sdl3 import Sdl3GamepadBackend
+
+        backend = Sdl3GamepadBackend()
+        local_runtime = Path("D:/dev/nxbt")
+
+        with mock.patch.dict("os.environ", {}, clear=False):
+            with mock.patch.object(
+                Sdl3GamepadBackend,
+                "_find_local_runtime_dir",
+                return_value=local_runtime,
+            ):
+                backend._configure_local_runtime_path()
+
+            self.assertEqual(os.environ["SDL_BINARY_PATH"], str(local_runtime))
+            self.assertEqual(os.environ["SDL_DISABLE_METADATA"], "1")
+
+    def test_sdl3_backend_drops_disconnected_gamepads(self):
+        from nxbt.qt.input_backends.sdl3 import Sdl3GamepadBackend
+
+        gamepad = FakeSdl3Gamepad(
+            instance_id=33,
+            name="Switch Pro Controller",
+            connected=True,
         )
-        backend._read_joystick_packet("gamepad:xinput", joystick)
+        fake_sdl3 = FakeSdl3Module([gamepad])
+        backend = Sdl3GamepadBackend()
+        backend._sdl3 = fake_sdl3
 
-        joystick = FakeJoystick(
-            name="Xbox 360 Controller",
-            axes=[0.0, 0.0, 0.0, 0.0, -0.25, 0.0],
-            buttons=[0] * 11,
-            hats=[],
-        )
-        packet = backend._read_joystick_packet("gamepad:xinput", joystick)
-        self.assertFalse(packet["ZL"])
-        self.assertTrue(packet["ZR"])
+        providers = backend.list_providers()
+        backend.claim(providers[0].provider_id, 0)
+        gamepad.connected = False
 
-        joystick = FakeJoystick(
-            name="Xbox 360 Controller",
-            axes=[0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-            buttons=[0] * 11,
-            hats=[],
-        )
-        packet = backend._read_joystick_packet("gamepad:xinput", joystick)
-        self.assertTrue(packet["ZL"])
-        self.assertTrue(packet["ZR"])
+        packets = backend.poll()
 
-    def test_xinput_unsigned_trigger_threshold_uses_fifty_percent(self):
-        from nxbt.qt.input_backends.pygame import PygameGamepadBackend
-
-        backend = PygameGamepadBackend()
-        backend._trigger_axis_modes["gamepad:xinput"] = {4: "unsigned", 5: "unsigned"}
-        joystick = FakeJoystick(
-            name="Xbox 360 Controller",
-            axes=[0.0, 0.0, 0.0, 0.0, 0.49, 0.5],
-            buttons=[0] * 11,
-            hats=[],
-        )
-
-        packet = backend._read_joystick_packet("gamepad:xinput", joystick)
-        self.assertFalse(packet["ZL"])
-        self.assertTrue(packet["ZR"])
+        self.assertEqual(packets, {})
+        self.assertEqual(fake_sdl3.closed, [33])
 
 
 if __name__ == "__main__":

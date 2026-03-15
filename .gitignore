@@ -151,3 +151,4 @@ key.pem
 # Nuitka
 release
 .bumble-state/keys.json
+SDL3.dll
