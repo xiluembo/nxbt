@@ -40,6 +40,10 @@ dependencies = [
 dev = [
     "pytest"
 ]
+qt = [
+    "PyQt6>=6.7,<7",
+    "pygame>=2.6,<3"
+]
 windows = [
     "bumble==0.0.226"
 ]

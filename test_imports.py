@@ -12,6 +12,11 @@ class ImportSmokeTests(unittest.TestCase):
 
         self.assertTrue(hasattr(nxbt.cli, "main"))
 
+    def test_qt_import(self):
+        import nxbt.qt
+
+        self.assertTrue(hasattr(nxbt.qt, "start_qt_app"))
+
     def test_controller_server_import(self):
         from nxbt.controller.server import ControllerServer
 

@@ -13,7 +13,16 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "command",
     default=False,
-    choices=["webapp", "demo", "macro", "tui", "remote_tui", "addresses", "test"],
+    choices=[
+        "webapp",
+        "demo",
+        "macro",
+        "tui",
+        "remote_tui",
+        "qt",
+        "addresses",
+        "test",
+    ],
     help="""Specifies the nxbt command to run:
                     webapp - Runs web server and allows for controller/macro
                     input from a web browser.
@@ -22,7 +31,8 @@ parser.add_argument(
                     macro - Allows for input of a specified macro from the command line
                     (with the argument -s) or from a file (with the argument -f).
                     tui/remote_tui - Opens a TUI that allows for direct input from the keyboard
-                    to the Switch. 
+                    to the Switch.
+                    qt - Opens a desktop UI built with PyQt6.
                     addresses - Lists the Bluetooth MAC addresses for
                     all previously connected Nintendo Switches.
                     test - Runs through a series of tests to ensure NXBT is working and
@@ -108,6 +118,7 @@ parser.add_argument(
 args = None
 TUI_IMPORT_DEPENDENCIES = {"blessed", "psutil"}
 WEB_IMPORT_DEPENDENCIES = {"flask", "flask_socketio"}
+QT_IMPORT_DEPENDENCIES = {"PyQt6"}
 
 
 MACRO = """
@@ -479,6 +490,30 @@ def _start_webapp(ip, port, usessl, cert_path):
         print(exc)
 
 
+def _start_qt():
+    try:
+        from .qt import start_qt_app
+    except ModuleNotFoundError as exc:
+        if _is_missing_dependency(exc, QT_IMPORT_DEPENDENCIES):
+            print("The desktop UI dependencies are not installed.")
+            print("Install nxbt's desktop UI dependencies and try again.")
+            print("Suggested command:")
+            print("python -m pip install PyQt6 pygame")
+            return
+        raise
+
+    try:
+        start_qt_app()
+    except ModuleNotFoundError as exc:
+        if _is_missing_dependency(exc, QT_IMPORT_DEPENDENCIES):
+            print("The desktop UI dependencies are not installed.")
+            print("Install nxbt's desktop UI dependencies and try again.")
+            print("Suggested command:")
+            print("python -m pip install PyQt6 pygame")
+            return
+        raise
+
+
 def main():
     cli_args = parsed_args()
 
@@ -497,10 +532,14 @@ def main():
         _start_tui()
     elif cli_args.command == "remote_tui":
         _start_tui(force_remote=True)
+    elif cli_args.command == "qt":
+        _start_qt()
     elif cli_args.command == "addresses":
         list_switch_addresses()
     elif cli_args.command == "test":
         test()
+
+
 def parsed_args():
     global args
     if args is None:

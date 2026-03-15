@@ -6,7 +6,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from nxbt.cli import _start_webapp, resolve_reconnect_target
+from nxbt.cli import _start_qt, _start_webapp, resolve_reconnect_target
 
 
 class CliReconnectResolutionTests(unittest.TestCase):
@@ -106,6 +106,31 @@ class CliReconnectResolutionTests(unittest.TestCase):
                 _start_webapp("0.0.0.0", 8000, False, None)
 
         self.assertIn("Unable to bind the NXBT webapp", output.getvalue())
+
+    def test_qt_missing_dependency_prints_helpful_message(self):
+        output = io.StringIO()
+
+        real_import = __import__
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name.startswith("PyQt6"):
+                raise ModuleNotFoundError("No module named 'PyQt6'")
+            return real_import(name, globals, locals, fromlist, level)
+
+        original_qt = sys.modules.pop("nxbt.qt", None)
+        original_qt_app = sys.modules.pop("nxbt.qt.app", None)
+        try:
+            with redirect_stdout(output):
+                with patch("builtins.__import__", side_effect=fake_import):
+                    _start_qt()
+        finally:
+            if original_qt is not None:
+                sys.modules["nxbt.qt"] = original_qt
+            if original_qt_app is not None:
+                sys.modules["nxbt.qt.app"] = original_qt_app
+
+        self.assertIn("desktop UI dependencies are not installed", output.getvalue())
+        self.assertIn("PyQt6", output.getvalue())
 
 
 if __name__ == "__main__":
