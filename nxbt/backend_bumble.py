@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import json
 import os
@@ -27,6 +28,14 @@ FIRMWARE_ENV_VAR = "BUMBLE_RTK_FIRMWARE_DIR"
 _CLOSE_SENTINEL = object()
 
 
+class _ReconnectAuthenticationError(RuntimeError):
+    pass
+
+
+class _ReconnectEncryptionError(RuntimeError):
+    pass
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
@@ -39,15 +48,56 @@ def _firmware_dir() -> Path:
     return Path(os.environ.get(FIRMWARE_ENV_VAR) or (_repo_root() / ".bumble-firmware"))
 
 
-def _keystore_path() -> Path:
+def _configured_keystore_path() -> Path | None:
     configured = os.environ.get(KEYSTORE_ENV_VAR)
     if configured:
         return Path(configured)
+    return None
+
+
+def _legacy_keystore_path() -> Path:
     return _state_dir() / "keys.json"
+
+
+def _adapter_storage_key(adapter_path: str) -> str:
+    normalized = adapter_path.strip()
+    readable = "".join(
+        character.lower() if character.isalnum() else "_"
+        for character in normalized
+    ).strip("_")
+    if not readable:
+        readable = "adapter"
+    readable = readable[:48].rstrip("_")
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
+    return f"{readable}_{digest}"
+
+
+def _keystore_path(adapter_path: str | None = None) -> Path:
+    configured = _configured_keystore_path()
+    if configured is not None:
+        return configured
+    if adapter_path is None:
+        return _legacy_keystore_path()
+    return _state_dir() / "keystores" / f"{_adapter_storage_key(adapter_path)}.json"
+
+
+def _metadata_path(adapter_path: str) -> Path:
+    return _state_dir() / "metadata" / f"{_adapter_storage_key(adapter_path)}.json"
 
 
 def _default_transport() -> str:
     return os.environ.get(TRANSPORT_ENV_VAR, DEFAULT_TRANSPORT)
+
+
+def _firmware_setup_instructions() -> list[str]:
+    return [
+        (
+            "If this adapter is Realtek-based, install the Bumble firmware files "
+            f"(for example {REALTEK_FIRMWARE_REFERENCE}) in '.bumble-firmware' "
+            f"or point {FIRMWARE_ENV_VAR} to that directory."
+        ),
+        f"Reference: {REALTEK_FIRMWARE_HELP_URL}",
+    ]
 
 
 def _parse_device_class(device_class: str | int) -> int:
@@ -81,6 +131,23 @@ def _is_page_timeout_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_unacceptable_bd_addr_error(exc: BaseException) -> bool:
+    for candidate in _iter_exception_chain(exc):
+        error_name = getattr(candidate, "error_name", "")
+        if error_name == "CONNECTION_REJECTED_DUE_TO_UNACCEPTABLE_BD_ADDR_ERROR":
+            return True
+        if "CONNECTION_REJECTED_DUE_TO_UNACCEPTABLE_BD_ADDR_ERROR" in str(candidate):
+            return True
+    return False
+
+
+def _is_reconnect_authentication_error(exc: BaseException) -> bool:
+    for candidate in _iter_exception_chain(exc):
+        if isinstance(candidate, _ReconnectAuthenticationError):
+            return True
+    return False
+
+
 def _build_reconnect_error(reconnect_address, last_error: BaseException) -> OSError:
     if _is_page_timeout_error(last_error):
         message = (
@@ -90,10 +157,79 @@ def _build_reconnect_error(reconnect_address, last_error: BaseException) -> OSEr
         )
         return OSError(message, reconnect_address)
 
+    if _is_reconnect_authentication_error(last_error):
+        message = (
+            "Unable to reconnect because Bluetooth authentication did not complete "
+            "for this adapter. This usually means this adapter's saved pairing for "
+            "that Switch is stale or no longer matches the adapter's BD_ADDR. "
+            "Remove the saved pairing for this adapter and pair it again from "
+            "'Change Grip/Order', then retry reconnect."
+        )
+        return OSError(message, reconnect_address)
+
+    if _is_unacceptable_bd_addr_error(last_error):
+        message = (
+            "Unable to reconnect because the Switch rejected this adapter's "
+            "Bluetooth address. This usually means this specific adapter has not "
+            "been paired with that Switch yet, or its saved pairing is stale. "
+            "Pair this adapter once from 'Change Grip/Order' and then retry "
+            "reconnect."
+        )
+        return OSError(message, reconnect_address)
+
     return OSError(
         "Unable to reconnect to sockets at the given address(es)",
         reconnect_address,
     )
+
+
+def _looks_like_usb_error(exc: BaseException, marker: str) -> bool:
+    marker = marker.upper()
+    for candidate in _iter_exception_chain(exc):
+        if marker in type(candidate).__name__.upper():
+            return True
+        if marker in str(candidate).upper():
+            return True
+    return False
+
+
+def _build_transport_open_error(adapter_path: str, exc: BaseException) -> OSError:
+    if _looks_like_usb_error(exc, "LIBUSB_ERROR_NOT_SUPPORTED") or _looks_like_usb_error(
+        exc, "USBERRORNOTSUPPORTED"
+    ):
+        message = (
+            f"Unable to open USB adapter '{adapter_path}'. libusb reported "
+            "LIBUSB_ERROR_NOT_SUPPORTED. On Windows this usually means the selected "
+            "dongle is not bound to a libusb-compatible driver instance. Reinstall "
+            "WinUSB for that specific dongle with Zadig and retry."
+        )
+        return OSError(message)
+
+    if _looks_like_usb_error(exc, "LIBUSB_ERROR_ACCESS") or _looks_like_usb_error(
+        exc, "USBERRORACCESS"
+    ):
+        message = (
+            f"Unable to open USB adapter '{adapter_path}'. libusb reported "
+            "LIBUSB_ERROR_ACCESS. Another process or the Windows Bluetooth stack "
+            "still owns this dongle, or this device instance is not using WinUSB."
+        )
+        return OSError(message)
+
+    return OSError(f"Unable to open USB adapter '{adapter_path}': {exc}")
+
+
+def _normalize_color_triplet(value: Any) -> list[int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+
+    normalized = []
+    for component in value:
+        try:
+            numeric = int(component)
+        except (TypeError, ValueError):
+            return None
+        normalized.append(max(0, min(255, numeric)))
+    return normalized
 
 
 def _load_bumble_modules() -> dict[str, Any]:
@@ -318,6 +454,7 @@ class _BumbleRuntime:
     def __init__(
         self,
         transport_spec: str,
+        adapter_id: str,
         alias: str,
         class_of_device: int,
         discoverable: bool,
@@ -331,7 +468,7 @@ class _BumbleRuntime:
         self.connectable = connectable
         self.sdp_record_xml = sdp_record_xml
         self.firmware_dir = _firmware_dir()
-        self.keystore_path = _keystore_path()
+        self.keystore_path = _keystore_path(adapter_id)
         self.address = "00:00:00:00:00:00"
         self.loop = asyncio.new_event_loop()
         self.thread: threading.Thread | None = None
@@ -406,7 +543,10 @@ class _BumbleRuntime:
             discoverable=self.discoverable,
         )
 
-        self.transport = await modules["open_transport"](self.transport_spec)
+        try:
+            self.transport = await modules["open_transport"](self.transport_spec)
+        except Exception as exc:
+            raise _build_transport_open_error(self.transport_spec, exc) from exc
         self.device = modules["Device"].from_config_with_hci(
             device_config, self.transport.source, self.transport.sink
         )
@@ -512,15 +652,33 @@ class _BumbleRuntime:
             timeout=CLASSIC_CONNECT_TIMEOUT,
         )
         if not connection.authenticated:
-            await asyncio.wait_for(
-                connection.authenticate(),
-                timeout=CLASSIC_AUTH_TIMEOUT,
-            )
+            try:
+                await asyncio.wait_for(
+                    connection.authenticate(),
+                    timeout=CLASSIC_AUTH_TIMEOUT,
+                )
+            except Exception as exc:
+                try:
+                    await connection.disconnect()
+                except Exception:
+                    pass
+                raise _ReconnectAuthenticationError(
+                    "Bluetooth authentication did not complete during reconnect."
+                ) from exc
         if not connection.encryption:
-            await asyncio.wait_for(
-                connection.encrypt(),
-                timeout=CLASSIC_ENCRYPT_TIMEOUT,
-            )
+            try:
+                await asyncio.wait_for(
+                    connection.encrypt(),
+                    timeout=CLASSIC_ENCRYPT_TIMEOUT,
+                )
+            except Exception as exc:
+                try:
+                    await connection.disconnect()
+                except Exception:
+                    pass
+                raise _ReconnectEncryptionError(
+                    "Bluetooth link encryption did not complete during reconnect."
+                ) from exc
         session = self._prepare_session(connection)
         await asyncio.wait_for(
             self.hid_device.connect_control_channel(),
@@ -636,8 +794,16 @@ class _BumbleServerTransport:
 
 
 class BumbleControllerAdapter:
-    def __init__(self, adapter_path: str | None = None):
-        self.transport_spec = adapter_path or _default_transport()
+    def __init__(
+        self,
+        adapter_path: str | None = None,
+        *,
+        transport_spec: str | None = None,
+        keystore_aliases: list[str] | None = None,
+    ):
+        self.adapter_path = adapter_path or _default_transport()
+        self.transport_spec = transport_spec or self.adapter_path
+        self.keystore_aliases = list(keystore_aliases or [])
         self.alias = DEFAULT_ALIAS
         self.class_of_device = DEFAULT_CLASS_OF_DEVICE
         self.address = "00:00:00:00:00:00"
@@ -653,6 +819,7 @@ class BumbleControllerAdapter:
         if self.runtime is None:
             self.runtime = _BumbleRuntime(
                 transport_spec=self.transport_spec,
+                adapter_id=self.adapter_path,
                 alias=self.alias,
                 class_of_device=self.class_of_device,
                 discoverable=self.discoverable,
@@ -721,7 +888,9 @@ class BumbleControllerAdapter:
     def remove_device(self, path: str) -> None:
         if self.runtime is not None:
             self.runtime.call(self.runtime.disconnect_peer(path))
-        _delete_paired_address(path)
+        _delete_paired_address(path, self.adapter_path)
+        for alias in self.keystore_aliases:
+            _delete_paired_address(path, alias)
 
     def create_server_transport(self) -> _BumbleServerTransport:
         runtime = self._ensure_runtime()
@@ -761,88 +930,308 @@ class BumbleControllerAdapter:
             self.runtime = None
 
 
-def _delete_paired_address(address: str) -> None:
-    keystore_path = _keystore_path()
-    if not keystore_path.exists():
-        return
+def _load_keystore_data(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
 
     try:
-        with open(keystore_path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
     except Exception:
+        return None
+
+
+def _save_keystore_data(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, sort_keys=True, indent=4)
+
+
+def _load_metadata_data(path: Path) -> dict[str, Any]:
+    data = _load_keystore_data(path)
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def _save_metadata_data(path: Path, data: dict[str, Any]) -> None:
+    _save_keystore_data(path, data)
+
+
+def _merge_mapping_file(target_path: Path, source_path: Path) -> None:
+    if target_path == source_path:
         return
 
+    source_data = _load_keystore_data(source_path)
+    if not isinstance(source_data, dict) or not source_data:
+        return
+
+    target_data = _load_keystore_data(target_path)
+    if not isinstance(target_data, dict):
+        target_data = {}
+
     changed = False
-    for namespace in data.values():
-        if not isinstance(namespace, dict):
+    for key, value in source_data.items():
+        if key not in target_data:
+            target_data[key] = value
+            changed = True
             continue
-        for key in list(namespace.keys()):
-            if _address_to_string(key) == _address_to_string(address):
-                del namespace[key]
-                changed = True
+
+        if isinstance(target_data[key], dict) and isinstance(value, dict):
+            for nested_key, nested_value in value.items():
+                if nested_key not in target_data[key]:
+                    target_data[key][nested_key] = nested_value
+                    changed = True
+
+    if changed:
+        _save_keystore_data(target_path, target_data)
+
+
+def _iter_keystore_paths(adapter_path: str | None = None) -> list[Path]:
+    configured = _configured_keystore_path()
+    if configured is not None:
+        return [configured]
+
+    if adapter_path is not None:
+        return [_keystore_path(adapter_path)]
+
+    paths = []
+    keystore_dir = _state_dir() / "keystores"
+    if keystore_dir.exists():
+        paths.extend(sorted(keystore_dir.glob("*.json")))
+
+    legacy_path = _legacy_keystore_path()
+    if legacy_path.exists():
+        paths.append(legacy_path)
+
+    return paths
+
+
+def _delete_paired_address(address: str, adapter_path: str | None = None) -> None:
+    changed = False
+    for keystore_path in _iter_keystore_paths(adapter_path):
+        data = _load_keystore_data(keystore_path)
+        if not isinstance(data, dict):
+            continue
+
+        keystore_changed = False
+        for namespace in data.values():
+            if not isinstance(namespace, dict):
+                continue
+            for key in list(namespace.keys()):
+                if _address_to_string(key) == _address_to_string(address):
+                    del namespace[key]
+                    keystore_changed = True
+
+        if not keystore_changed:
+            continue
+
+        _save_keystore_data(keystore_path, data)
+        changed = True
 
     if not changed:
         return
 
-    keystore_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(keystore_path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, sort_keys=True, indent=4)
 
-
-def _read_paired_addresses() -> list[str]:
-    keystore_path = _keystore_path()
-    if not keystore_path.exists():
-        return []
-
-    try:
-        with open(keystore_path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except Exception:
-        return []
-
+def _read_paired_addresses(adapter_path: str | None = None) -> list[str]:
     addresses = set()
-    for namespace in data.values():
-        if not isinstance(namespace, dict):
+    for keystore_path in _iter_keystore_paths(adapter_path):
+        data = _load_keystore_data(keystore_path)
+        if not isinstance(data, dict):
             continue
-        addresses.update(_address_to_string(address) for address in namespace.keys())
+        for namespace in data.values():
+            if not isinstance(namespace, dict):
+                continue
+            addresses.update(
+                _address_to_string(address) for address in namespace.keys()
+            )
     return sorted(addresses)
 
 
-def _list_usb_adapters() -> list[str]:
+def _read_switch_metadata(adapter_path: str) -> dict[str, dict[str, list[int]]]:
+    path = _metadata_path(adapter_path)
+    data = _load_metadata_data(path)
+    result = {}
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            continue
+        body_color = _normalize_color_triplet(value.get("colour_body"))
+        button_color = _normalize_color_triplet(value.get("colour_buttons"))
+        if body_color is None and button_color is None:
+            continue
+        entry = {}
+        if body_color is not None:
+            entry["colour_body"] = body_color
+        if button_color is not None:
+            entry["colour_buttons"] = button_color
+        result[_address_to_string(key)] = entry
+    return result
+
+
+def _write_switch_metadata(
+    adapter_path: str, address: str, metadata: dict[str, Any]
+) -> None:
+    body_color = _normalize_color_triplet(metadata.get("colour_body"))
+    button_color = _normalize_color_triplet(metadata.get("colour_buttons"))
+    if body_color is None and button_color is None:
+        return
+
+    path = _metadata_path(adapter_path)
+    data = _load_metadata_data(path)
+    normalized_address = _address_to_string(address)
+    entry = dict(data.get(normalized_address, {}))
+    if body_color is not None:
+        entry["colour_body"] = body_color
+    if button_color is not None:
+        entry["colour_buttons"] = button_color
+    data[normalized_address] = entry
+    _save_metadata_data(path, data)
+
+
+def _delete_switch_metadata(address: str, adapter_path: str | None = None) -> None:
+    if not adapter_path:
+        return
+
+    path = _metadata_path(adapter_path)
+    data = _load_metadata_data(path)
+    if not data:
+        return
+
+    normalized_address = _address_to_string(address)
+    if normalized_address not in data:
+        return
+
+    del data[normalized_address]
+    _save_metadata_data(path, data)
+
+
+def _merge_adapter_storage(adapter_path: str, aliases: list[str]) -> None:
+    target_keystore = _keystore_path(adapter_path)
+    target_metadata = _metadata_path(adapter_path)
+    for alias in aliases:
+        _merge_mapping_file(target_keystore, _keystore_path(alias))
+        _merge_mapping_file(target_metadata, _metadata_path(alias))
+
+
+def _device_matches_bluetooth_hci(device) -> bool:
+    if (
+        device.getDeviceClass(),
+        device.getDeviceSubClass(),
+        device.getDeviceProtocol(),
+    ) == (0xE0, 0x01, 0x01):
+        return True
+
+    if device.getDeviceClass() != 0x00:
+        return False
+
+    for configuration in device:
+        for interface in configuration:
+            for setting in interface:
+                if (
+                    setting.getClass(),
+                    setting.getSubClass(),
+                    setting.getProtocol(),
+                ) == (0xE0, 0x01, 0x01):
+                    return True
+    return False
+
+
+def _usb_device_serial_spec(device) -> str | None:
+    vendor_product = f"{device.getVendorID():04X}:{device.getProductID():04X}"
+    try:
+        serial_number = device.getSerialNumber()
+    except Exception:
+        serial_number = None
+    if serial_number:
+        return f"usb:{vendor_product}/{serial_number}"
+    return None
+
+
+def _usb_device_port_spec(device) -> str | None:
+    try:
+        bus_number = device.getBusNumber()
+        port_numbers = list(device.getPortNumberList())
+    except Exception:
+        bus_number = None
+        port_numbers = []
+    if bus_number is not None and port_numbers:
+        port_path = ".".join(str(number) for number in port_numbers)
+        return f"usb:{bus_number}-{port_path}"
+    return None
+
+
+def _usb_transport_spec(device, duplicate_counts: dict[str, int]) -> str:
+    port_spec = _usb_device_port_spec(device)
+    if port_spec is not None:
+        return port_spec
+
+    serial_spec = _usb_device_serial_spec(device)
+    if serial_spec is not None:
+        return serial_spec
+
+    vendor_product = f"{device.getVendorID():04X}:{device.getProductID():04X}"
+
+    duplicate_index = duplicate_counts.get(vendor_product, 0)
+    duplicate_counts[vendor_product] = duplicate_index + 1
+    if duplicate_index == 0:
+        return f"usb:{vendor_product}"
+    return f"usb:{vendor_product}#{duplicate_index}"
+
+
+def _usb_adapter_descriptor(device, duplicate_counts: dict[str, int]) -> dict[str, Any]:
+    adapter_id = _usb_transport_spec(device, duplicate_counts)
+    aliases = []
+    serial_spec = _usb_device_serial_spec(device)
+    if serial_spec is not None and serial_spec != adapter_id:
+        aliases.append(serial_spec)
+    probe_error = None
+    try:
+        handle = device.open()
+        handle.close()
+    except Exception as exc:
+        probe_error = _build_transport_open_error(adapter_id, exc)
+    return {
+        "id": adapter_id,
+        "transport_spec": adapter_id,
+        "aliases": aliases,
+        "probe_error": str(probe_error) if probe_error is not None else "",
+        "is_available": probe_error is None,
+    }
+
+
+def _list_usb_adapter_descriptors() -> list[dict[str, Any]]:
     modules = _load_usb_modules()
     modules["load_libusb"]()
     usb1 = modules["usb1"]
-    adapters = []
+    descriptors = []
+    duplicate_counts: dict[str, int] = {}
 
     context = usb1.USBContext()
     context.open()
     try:
-        index = 0
         for device in context.getDeviceIterator(skip_on_error=True):
             try:
-                for configuration in device:
-                    found = False
-                    for interface in configuration:
-                        for setting in interface:
-                            if (
-                                setting.getClass(),
-                                setting.getSubClass(),
-                                setting.getProtocol(),
-                            ) == (0xE0, 0x01, 0x01):
-                                adapters.append(f"usb:{index}")
-                                index += 1
-                                found = True
-                                break
-                        if found:
-                            break
-                    if found:
-                        break
+                if _device_matches_bluetooth_hci(device):
+                    descriptors.append(_usb_adapter_descriptor(device, duplicate_counts))
             finally:
                 device.close()
     finally:
         context.close()
 
-    return adapters
+    return descriptors
+
+
+def _list_usb_adapters() -> list[str]:
+    return [descriptor["id"] for descriptor in _list_usb_adapter_descriptors()]
+
+
+def _resolve_usb_adapter_descriptor(adapter_path: str) -> dict[str, Any] | None:
+    for descriptor in _list_usb_adapter_descriptors():
+        if adapter_path == descriptor["id"]:
+            return descriptor
+        if adapter_path in descriptor.get("aliases", []):
+            return descriptor
+    return None
 
 
 class BumbleBackend(BaseBackend):
@@ -869,15 +1258,81 @@ class BumbleBackend(BaseBackend):
         transport_spec = _default_transport()
         if transport_spec != DEFAULT_TRANSPORT:
             return [transport_spec]
-        return _list_usb_adapters()
+        return [
+            descriptor["id"]
+            for descriptor in _list_usb_adapter_descriptors()
+            if descriptor.get("is_available", True)
+        ]
 
-    def get_switch_addresses(self) -> list[str]:
-        return _read_paired_addresses()
+    def get_switch_addresses(self, adapter_path: str | None = None) -> list[str]:
+        if adapter_path is not None:
+            descriptor = _resolve_usb_adapter_descriptor(adapter_path)
+            if descriptor is not None:
+                addresses = set(_read_paired_addresses(descriptor["id"]))
+                for alias in descriptor.get("aliases", []):
+                    addresses.update(_read_paired_addresses(alias))
+                return sorted(addresses)
+        return _read_paired_addresses(adapter_path)
+
+    def get_switch_metadata(
+        self, adapter_path: str | None, address: str
+    ) -> dict[str, Any] | None:
+        if not adapter_path:
+            return None
+
+        descriptor = _resolve_usb_adapter_descriptor(adapter_path)
+        candidates = [adapter_path]
+        if descriptor is not None:
+            candidates = [descriptor["id"], *descriptor.get("aliases", [])]
+
+        normalized_address = _address_to_string(address)
+        for candidate in candidates:
+            metadata = _read_switch_metadata(candidate).get(normalized_address)
+            if metadata:
+                return metadata
+        return None
+
+    def save_switch_metadata(
+        self, adapter_path: str | None, address: str, metadata: dict[str, Any]
+    ) -> None:
+        if not adapter_path or not address:
+            return
+
+        descriptor = _resolve_usb_adapter_descriptor(adapter_path)
+        target_adapter = descriptor["id"] if descriptor is not None else adapter_path
+        _write_switch_metadata(target_adapter, address, metadata)
+
+    def forget_switch_pairing(self, adapter_path: str | None, address: str) -> None:
+        if not adapter_path or not address:
+            return
+
+        descriptor = _resolve_usb_adapter_descriptor(adapter_path)
+        candidates = [adapter_path]
+        if descriptor is not None:
+            candidates = [descriptor["id"], *descriptor.get("aliases", [])]
+
+        for candidate in candidates:
+            _delete_paired_address(address, candidate)
+            _delete_switch_metadata(address, candidate)
 
     def create_controller_adapter(
         self, adapter_path: str | None = None
     ) -> BumbleControllerAdapter:
-        return BumbleControllerAdapter(adapter_path=adapter_path)
+        transport_spec = adapter_path or _default_transport()
+        resolved_adapter_path = adapter_path or transport_spec
+        aliases: list[str] = []
+        if adapter_path is not None:
+            descriptor = _resolve_usb_adapter_descriptor(adapter_path)
+            if descriptor is not None:
+                resolved_adapter_path = descriptor["id"]
+                transport_spec = descriptor["transport_spec"]
+                aliases = list(descriptor.get("aliases", []))
+                _merge_adapter_storage(resolved_adapter_path, aliases)
+        return BumbleControllerAdapter(
+            adapter_path=resolved_adapter_path,
+            transport_spec=transport_spec,
+            keystore_aliases=aliases,
+        )
 
     def get_status(self) -> dict[str, Any]:
         try:
@@ -908,10 +1363,30 @@ class BumbleBackend(BaseBackend):
                 "controller_transport_ready": False,
                 "transport": transport_spec,
                 "firmware_dir": str(firmware_dir),
+                "firmware_files": sorted(
+                    file.name for file in firmware_dir.glob("*") if file.is_file()
+                )
+                if firmware_dir.exists()
+                else [],
+                "firmware_reference": REALTEK_FIRMWARE_REFERENCE,
+                "firmware_help_url": REALTEK_FIRMWARE_HELP_URL,
+                "firmware_setup_instructions": _firmware_setup_instructions(),
                 "message": adapter_error,
             }
 
         available = bool(adapters)
+        adapter_details = _list_usb_adapter_descriptors()
+        unavailable_adapter_details = [
+            descriptor
+            for descriptor in adapter_details
+            if not descriptor.get("is_available", True)
+        ]
+        firmware_files = (
+            sorted(file.name for file in firmware_dir.glob("*") if file.is_file())
+            if firmware_dir.exists()
+            else []
+        )
+        firmware_instructions = _firmware_setup_instructions()
         return {
             "name": self.name,
             "supported": True,
@@ -919,12 +1394,13 @@ class BumbleBackend(BaseBackend):
             "controller_transport_ready": available,
             "transport": transport_spec,
             "available_adapters": adapters,
+            "available_adapter_details": adapter_details,
+            "unavailable_adapter_details": unavailable_adapter_details,
             "firmware_dir": str(firmware_dir),
-            "firmware_files": sorted(
-                file.name for file in firmware_dir.glob("*") if file.is_file()
-            )
-            if firmware_dir.exists()
-            else [],
+            "firmware_files": firmware_files,
+            "firmware_reference": REALTEK_FIRMWARE_REFERENCE,
+            "firmware_help_url": REALTEK_FIRMWARE_HELP_URL,
+            "firmware_setup_instructions": firmware_instructions,
             "message": (
                 "Bumble backend ready."
                 if available

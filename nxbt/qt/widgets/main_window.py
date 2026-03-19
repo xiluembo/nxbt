@@ -193,7 +193,10 @@ class MainWindow(QMainWindow):
 
         dialog = CreateControllerDialog(
             adapters=adapters,
-            saved_addresses=self.controller_manager.get_saved_switch_addresses(),
+            saved_metadata_by_adapter=(
+                self.controller_manager.get_saved_switch_metadata_by_adapter(adapters)
+            ),
+            forget_pairing_callback=self.controller_manager.forget_saved_switch,
             parent=self,
         )
         if dialog.exec() == dialog.DialogCode.Accepted:
@@ -205,7 +208,11 @@ class MainWindow(QMainWindow):
                     reconnect_target=dialog.reconnect_target(),
                 )
             except Exception as exc:
-                QMessageBox.critical(self, "Unable to Create Controller", str(exc))
+                QMessageBox.critical(
+                    self,
+                    "Unable to Create Controller",
+                    str(exc),
+                )
                 return
             self._ensure_session_card(session)
             self._refresh_provider_choices()
@@ -260,7 +267,7 @@ class MainWindow(QMainWindow):
         self.adapter_count_label.setText(
             f"Free Bluetooth adapters: {len(free_adapters)}"
         )
-        warnings = self.input_manager.get_warnings()
+        warnings = self._collect_warnings()
         if warnings:
             self.warning_label.setText("\n".join(warnings))
             self.warning_label.show()
@@ -401,3 +408,19 @@ class MainWindow(QMainWindow):
         if width >= 900:
             return 2
         return 1
+
+    def _collect_warnings(self) -> list[str]:
+        warnings = []
+        backend_status = self.controller_manager.backend_status
+        backend_message = backend_status.get("message", "")
+        if backend_message and not backend_status.get("available", True):
+            warnings.append(backend_message)
+
+        for descriptor in backend_status.get("unavailable_adapter_details", []):
+            adapter_id = descriptor.get("id", "unknown")
+            probe_error = descriptor.get("probe_error", "")
+            if probe_error:
+                warnings.append(f"{adapter_id}: {probe_error}")
+
+        warnings.extend(self.input_manager.get_warnings())
+        return warnings

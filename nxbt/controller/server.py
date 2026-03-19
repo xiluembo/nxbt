@@ -63,6 +63,8 @@ class ControllerServer:
             colour_body=self.colour_body,
             colour_buttons=self.colour_buttons,
         )
+        self.colour_body = list(self.protocol.colour_body)
+        self.colour_buttons = list(self.protocol.colour_buttons)
 
         self.input = InputParser(self.protocol)
 
@@ -109,6 +111,16 @@ class ControllerServer:
 
             self.switch_address = itr.getpeername()[0]
             self.state["last_connection"] = self.switch_address
+            self.state["colour_body"] = list(self.colour_body)
+            self.state["colour_buttons"] = list(self.colour_buttons)
+            self.backend.save_switch_metadata(
+                getattr(self.bt, "adapter_path", None),
+                self.switch_address,
+                {
+                    "colour_body": self.colour_body,
+                    "colour_buttons": self.colour_buttons,
+                },
+            )
 
             self.state["state"] = "connected"
 

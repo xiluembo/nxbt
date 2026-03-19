@@ -231,8 +231,15 @@ def resolve_reconnect_target(cli_args, addresses):
 def get_reconnect_target():
     cli_args = parsed_args()
     backend = get_backend()
+    preferred_adapter = None
+    try:
+        adapters = backend.get_available_adapters()
+        if adapters:
+            preferred_adapter = adapters[0]
+    except Exception:
+        preferred_adapter = None
     reconnect_target, message = resolve_reconnect_target(
-        cli_args, backend.get_switch_addresses()
+        cli_args, backend.get_switch_addresses(preferred_adapter)
     )
     if message:
         print(message)
@@ -395,10 +402,12 @@ def macro():
 
     nx = Nxbt(debug=cli_args.debug, log_to_file=cli_args.logfile)
     print("Creating controller...")
+    colour_body = None if reconnect_target else random_colour()
+    colour_buttons = None if reconnect_target else random_colour()
     index = nx.create_controller(
         PRO_CONTROLLER,
-        colour_body=random_colour(),
-        colour_buttons=random_colour(),
+        colour_body=colour_body,
+        colour_buttons=colour_buttons,
         reconnect_address=reconnect_target,
     )
     if reconnect_target:
@@ -424,23 +433,31 @@ def macro():
 def list_switch_addresses():
     backend = get_backend()
     try:
-        addresses = backend.get_switch_addresses()
+        adapters = backend.get_available_adapters()
     except BackendUnavailableError as exc:
         print(exc)
         print(f"Override the backend with {BACKEND_ENV_VAR} if needed.")
         return
 
-    if not addresses or len(addresses) < 1:
+    adapter_rows = []
+    for adapter in adapters:
+        for address in backend.get_switch_addresses(adapter):
+            adapter_rows.append((adapter, address))
+
+    if not adapter_rows:
+        addresses = backend.get_switch_addresses()
+        adapter_rows = [("Any Adapter", address) for address in addresses]
+
+    if not adapter_rows:
         print("No Switches have previously connected to this device.")
         return
 
-    print("---------------------------")
-    print("| Num | Address           |")
-    print("---------------------------")
-    for i in range(0, len(addresses)):
-        address = addresses[i]
-        print(f"| {i + 1}   | {address} |")
-    print("---------------------------")
+    print("---------------------------------------------------------------")
+    print("| Num | Adapter                         | Address           |")
+    print("---------------------------------------------------------------")
+    for index, (adapter, address) in enumerate(adapter_rows, start=1):
+        print(f"| {index:<3} | {adapter:<31} | {address} |")
+    print("---------------------------------------------------------------")
 
 
 def _is_missing_dependency(exc, dependency_names):

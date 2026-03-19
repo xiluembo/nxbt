@@ -608,6 +608,22 @@ class Nxbt:
             else:
                 raise ValueError("No adapters available")
 
+        reconnect_lookup_address = None
+        if isinstance(reconnect_address, str):
+            reconnect_lookup_address = reconnect_address
+        elif isinstance(reconnect_address, list) and len(reconnect_address) == 1:
+            reconnect_lookup_address = reconnect_address[0]
+
+        if reconnect_lookup_address and (
+            colour_body is None or colour_buttons is None
+        ):
+            metadata = self.get_switch_metadata(adapter_path, reconnect_lookup_address)
+            if metadata:
+                if colour_body is None:
+                    colour_body = metadata.get("colour_body")
+                if colour_buttons is None:
+                    colour_buttons = metadata.get("colour_buttons")
+
         controller_index = None
         try:
             self._controller_lock.acquire()
@@ -711,7 +727,7 @@ class Nxbt:
 
         return self.backend.get_available_adapters()
 
-    def get_switch_addresses(self):
+    def get_switch_addresses(self, adapter_path=None):
         """Gets the Bluetooth MAC addresses of all
         previously connected Nintendo Switchs
 
@@ -719,7 +735,13 @@ class Nxbt:
         :rtype: list
         """
 
-        return self.backend.get_switch_addresses()
+        return self.backend.get_switch_addresses(adapter_path)
+
+    def get_switch_metadata(self, adapter_path, address):
+        return self.backend.get_switch_metadata(adapter_path, address)
+
+    def forget_switch_pairing(self, adapter_path, address):
+        self.backend.forget_switch_pairing(adapter_path, address)
 
     def get_backend_status(self):
         return self.backend.get_status()

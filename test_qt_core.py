@@ -16,8 +16,23 @@ class FakeNxbt:
         self.removed = []
         self.macros = []
         self.inputs = []
+        self.forgot_pairings = []
         self._controller_counter = 0
         self._state = {}
+        self.saved_addresses = {
+            "adapter-0": ["AA:BB:CC:DD:EE:FF"],
+            "adapter-1": ["11:22:33:44:55:66"],
+        }
+        self.saved_metadata = {
+            ("adapter-0", "AA:BB:CC:DD:EE:FF"): {
+                "colour_body": [10, 20, 30],
+                "colour_buttons": [40, 50, 60],
+            },
+            ("adapter-1", "11:22:33:44:55:66"): {
+                "colour_body": [70, 80, 90],
+                "colour_buttons": [100, 110, 120],
+            },
+        }
 
     def get_backend_status(self):
         return {"name": "fake"}
@@ -25,8 +40,23 @@ class FakeNxbt:
     def get_available_adapters(self):
         return ["adapter-0", "adapter-1"]
 
-    def get_switch_addresses(self):
-        return ["AA:BB:CC:DD:EE:FF"]
+    def get_switch_addresses(self, adapter_path=None):
+        if adapter_path is None:
+            addresses = []
+            for saved in self.saved_addresses.values():
+                addresses.extend(saved)
+            return addresses
+        return list(self.saved_addresses.get(adapter_path, []))
+
+    def get_switch_metadata(self, adapter_path, address):
+        return self.saved_metadata.get((adapter_path, address))
+
+    def forget_switch_pairing(self, adapter_path, address):
+        self.forgot_pairings.append((adapter_path, address))
+        self.saved_addresses.setdefault(adapter_path, [])
+        if address in self.saved_addresses[adapter_path]:
+            self.saved_addresses[adapter_path].remove(address)
+        self.saved_metadata.pop((adapter_path, address), None)
 
     def create_controller(
         self,
@@ -231,6 +261,43 @@ class ControllerManagerTests(unittest.TestCase):
         )
         self.assertEqual(nx.inputs[-1][0], session.controller_index)
 
+    def test_saved_switch_addresses_are_filtered_by_adapter(self):
+        manager = ControllerManager(nx=FakeNxbt())
+
+        self.assertEqual(
+            manager.get_saved_switch_addresses("adapter-0"),
+            ["AA:BB:CC:DD:EE:FF"],
+        )
+        self.assertEqual(
+            manager.get_saved_switch_addresses("adapter-1"),
+            ["11:22:33:44:55:66"],
+        )
+
+    def test_saved_switch_metadata_is_grouped_by_adapter(self):
+        manager = ControllerManager(nx=FakeNxbt())
+
+        metadata = manager.get_saved_switch_metadata_by_adapter(["adapter-0", "adapter-1"])
+
+        self.assertEqual(
+            metadata["adapter-0"]["AA:BB:CC:DD:EE:FF"]["colour_body"],
+            [10, 20, 30],
+        )
+        self.assertEqual(
+            metadata["adapter-1"]["11:22:33:44:55:66"]["colour_buttons"],
+            [100, 110, 120],
+        )
+
+    def test_forget_saved_switch_removes_pairing_for_selected_adapter(self):
+        nx = FakeNxbt()
+        manager = ControllerManager(nx=nx)
+
+        manager.forget_saved_switch("adapter-0", "AA:BB:CC:DD:EE:FF")
+
+        self.assertEqual(
+            nx.forgot_pairings,
+            [("adapter-0", "AA:BB:CC:DD:EE:FF")],
+        )
+
 
 class InputBackendManagerTests(unittest.TestCase):
     def test_keyboard_backend_updates_sticks_and_presses(self):
@@ -390,7 +457,7 @@ class InputBackendManagerTests(unittest.TestCase):
         from nxbt.qt.input_backends.sdl3 import Sdl3GamepadBackend
 
         backend = Sdl3GamepadBackend()
-        local_runtime = Path("D:/dev/nxbt")
+        local_runtime = Path("local-sdl3-runtime")
 
         with mock.patch.dict("os.environ", {}, clear=False):
             with mock.patch.object(

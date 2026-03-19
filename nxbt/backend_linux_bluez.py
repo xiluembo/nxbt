@@ -151,7 +151,7 @@ class LinuxBlueZBackend(BaseBackend):
         finally:
             bus.close()
 
-    def get_switch_addresses(self) -> list[str]:
+    def get_switch_addresses(self, adapter_path: str | None = None) -> list[str]:
         self._ensure_supported()
         bluez = _load_bluez_module()
         return bluez.find_devices_by_alias("Nintendo Switch")
@@ -161,6 +161,11 @@ class LinuxBlueZBackend(BaseBackend):
     ) -> LinuxBlueZControllerAdapter:
         self._ensure_supported()
         return LinuxBlueZControllerAdapter(adapter_path=adapter_path)
+
+    def forget_switch_pairing(self, adapter_path: str | None, address: str) -> None:
+        self._ensure_supported()
+        adapter = self.create_controller_adapter(adapter_path=adapter_path)
+        adapter.remove_device(address)
 
     def get_status(self) -> dict[str, Any]:
         supported = sys.platform.startswith("linux")

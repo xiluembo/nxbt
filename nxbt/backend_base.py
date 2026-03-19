@@ -25,12 +25,25 @@ class BaseBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_switch_addresses(self) -> list[str]:
+    def get_switch_addresses(self, adapter_path: str | None = None) -> list[str]:
         raise NotImplementedError
 
     @abstractmethod
     def create_controller_adapter(self, adapter_path: str | None = None) -> Any:
         raise NotImplementedError
+
+    def get_switch_metadata(
+        self, adapter_path: str | None, address: str
+    ) -> dict[str, Any] | None:
+        return None
+
+    def save_switch_metadata(
+        self, adapter_path: str | None, address: str, metadata: dict[str, Any]
+    ) -> None:
+        return
+
+    def forget_switch_pairing(self, adapter_path: str | None, address: str) -> None:
+        return
 
     @abstractmethod
     def get_status(self) -> dict[str, Any]:
