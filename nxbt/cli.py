@@ -498,7 +498,7 @@ def _start_qt():
             print("The desktop UI dependencies are not installed.")
             print("Install nxbt's desktop UI dependencies and try again.")
             print("Suggested command:")
-            print("python -m pip install PyQt6 pygame")
+            print("python -m pip install PyQt6 PySDL3")
             return
         raise
 
@@ -509,7 +509,7 @@ def _start_qt():
             print("The desktop UI dependencies are not installed.")
             print("Install nxbt's desktop UI dependencies and try again.")
             print("Suggested command:")
-            print("python -m pip install PyQt6 pygame")
+            print("python -m pip install PyQt6 PySDL3")
             return
         raise
 
