@@ -1,6 +1,8 @@
 from time import perf_counter
 from json import dumps
 
+from .imu import copy_default_imu_data, normalize_imu_data
+
 
 DIRECT_INPUT_IDLE_PACKET = {
     # Sticks
@@ -49,6 +51,8 @@ DIRECT_INPUT_IDLE_PACKET = {
     "X": False,
     "B": False,
     "A": False,
+    # IMU
+    "IMU_DATA": copy_default_imu_data(),
 }
 
 
@@ -285,6 +289,8 @@ class InputParser:
             "R_STICK",
         )
 
+        imu_data = normalize_imu_data(controller_input.get("IMU_DATA"))
+
         # Converting binary strings to ints
         upper_byte = int("".join(upper), 2)
         shared_byte = int("".join(shared), 2)
@@ -293,6 +299,7 @@ class InputParser:
         self.protocol.set_button_inputs(upper_byte, shared_byte, lower_byte)
         self.protocol.set_left_stick_inputs(stick_left)
         self.protocol.set_right_stick_inputs(stick_right)
+        self.protocol.set_imu_data(imu_data)
 
         return controller_input
 

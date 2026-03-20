@@ -57,6 +57,10 @@ class SessionCard(QWidget):
         self.preview = ControllerPreviewWidget(self)
         self.preview.set_colors(session.body_color, session.button_color)
         preview_group_layout.addWidget(self.preview)
+        self.motion_label = QLabel(self)
+        self.motion_label.setWordWrap(True)
+        preview_group_layout.addWidget(self.motion_label)
+        self._set_motion_status("Motion Sensor: Default IMU", False)
         preview_group.setSizePolicy(
             QSizePolicy.Policy.Preferred,
             QSizePolicy.Policy.Fixed,
@@ -172,14 +176,30 @@ class SessionCard(QWidget):
             self.provider_note.setText(
                 "Assign a unique keyboard or gamepad provider."
             )
+            self._set_motion_status("Motion Sensor: Default IMU", False)
         else:
             provider = provider_map.get(assigned_provider_id)
-            if provider is not None and provider.details:
-                self.provider_note.setText(provider.details)
+            if provider is not None:
+                if provider.details:
+                    self.provider_note.setText(provider.details)
+                else:
+                    self.provider_note.setText(
+                        "This input provider is reserved for this controller."
+                    )
+                self._set_motion_status(
+                    provider.motion_status,
+                    provider.motion_available,
+                )
             else:
                 self.provider_note.setText(
                     "This input provider is reserved for this controller."
                 )
+                self._set_motion_status("Motion Sensor: Default IMU", False)
+
+    def _set_motion_status(self, status: str, active: bool) -> None:
+        color = "#84c97c" if active else "#9aa5b1"
+        self.motion_label.setStyleSheet(f"color: {color}; font-weight: 600;")
+        self.motion_label.setText(status)
 
     def _emit_provider_changed(self) -> None:
         provider_id = self.input_combo.currentData()

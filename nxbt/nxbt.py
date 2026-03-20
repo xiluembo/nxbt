@@ -10,6 +10,7 @@ import json
 from threading import Lock as ThreadLock, Thread
 
 from .controller import ControllerTypes
+from .controller.imu import copy_default_imu_data
 from .controller.server import ControllerServer, run_controller_server
 from .backend import get_backend, resolve_backend_name
 from .logging import create_logger
@@ -67,6 +68,8 @@ DIRECT_INPUT_PACKET = {
     "X": False,
     "B": False,
     "A": False,
+    # IMU
+    "IMU_DATA": copy_default_imu_data(),
 }
 
 

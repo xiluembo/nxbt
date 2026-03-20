@@ -7,7 +7,7 @@ from nxbt.qt.controller_manager import ControllerManager
 from nxbt.qt.input_backends.base import BaseInputBackend
 from nxbt.qt.input_backends.keyboard import KeyboardInputBackend
 from nxbt.qt.input_backends.manager import InputBackendManager
-from nxbt.qt.models import InputProvider
+from nxbt.qt.models import InputProvider, SessionRecord
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -15,9 +15,11 @@ try:
     from PyQt6.QtWidgets import QApplication
 
     from nxbt.qt.widgets.create_controller_dialog import CreateControllerDialog
+    from nxbt.qt.widgets.session_card import SessionCard
 except Exception:  # pragma: no cover - optional desktop dependency
     QApplication = None
     CreateControllerDialog = None
+    SessionCard = None
 
 
 class FakeNxbt:
@@ -145,17 +147,32 @@ class FakeProviderBackend(BaseInputBackend):
 
 
 class FakeSdl3Gamepad:
-    def __init__(self, *, instance_id, name, axes=None, buttons=None, connected=True):
+    def __init__(
+        self,
+        *,
+        instance_id,
+        name,
+        axes=None,
+        buttons=None,
+        sensors=None,
+        connected=True,
+    ):
         self.instance_id = instance_id
         self.name = name
         self.axes = dict(axes or {})
         self.buttons = dict(buttons or {})
+        self.sensors = dict(sensors or {})
+        self.enabled_sensors = set()
         self.connected = connected
 
 
 class FakeSdl3Module:
     SDL_INIT_GAMEPAD = 0x00002000
     SDL_INIT_EVENTS = 0x00004000
+    SDL_INIT_SENSOR = 0x00008000
+
+    SDL_SENSOR_ACCEL = 1
+    SDL_SENSOR_GYRO = 2
 
     SDL_GAMEPAD_AXIS_LEFTX = 0
     SDL_GAMEPAD_AXIS_LEFTY = 1
@@ -219,6 +236,31 @@ class FakeSdl3Module:
 
     def SDL_GetGamepadButton(self, gamepad, button):
         return 1 if gamepad.buttons.get(button, False) else 0
+
+    def SDL_GamepadHasSensor(self, gamepad, sensor_type):
+        return sensor_type in gamepad.sensors
+
+    def SDL_SetGamepadSensorEnabled(self, gamepad, sensor_type, enabled):
+        if sensor_type not in gamepad.sensors:
+            return False
+        if enabled:
+            gamepad.enabled_sensors.add(sensor_type)
+        else:
+            gamepad.enabled_sensors.discard(sensor_type)
+        return True
+
+    def SDL_GamepadSensorEnabled(self, gamepad, sensor_type):
+        return sensor_type in gamepad.enabled_sensors
+
+    def SDL_GetGamepadSensorData(self, gamepad, sensor_type, data, num_values):
+        if sensor_type not in gamepad.enabled_sensors:
+            return False
+        sensor_values = gamepad.sensors.get(sensor_type)
+        if sensor_values is None:
+            return False
+        for index in range(min(int(num_values), len(sensor_values))):
+            data[index] = sensor_values[index]
+        return True
 
     def SDL_GetError(self):
         return b"fake sdl3 error"
@@ -369,6 +411,40 @@ class CreateControllerDialogTests(unittest.TestCase):
         )
 
 
+@unittest.skipIf(QApplication is None or SessionCard is None, "PyQt6 is not available")
+class SessionCardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_session_card_shows_motion_status_for_assigned_provider(self):
+        session = SessionRecord(
+            controller_index=0,
+            adapter_path="adapter-0",
+            body_color=(10, 20, 30),
+            button_color=(40, 50, 60),
+            reconnect_target=None,
+        )
+        card = SessionCard(session)
+        self.addCleanup(card.deleteLater)
+
+        card.set_provider_choices(
+            [
+                InputProvider(
+                    "sdl3",
+                    "gamepad:11",
+                    "DualSense",
+                    profile_label="SDL3 Gamepad",
+                    motion_status="Motion Sensor: SDL3",
+                    motion_available=True,
+                )
+            ],
+            "gamepad:11",
+        )
+
+        self.assertEqual(card.motion_label.text(), "Motion Sensor: SDL3")
+
+
 class InputBackendManagerTests(unittest.TestCase):
     def test_keyboard_backend_updates_sticks_and_presses(self):
         backend = KeyboardInputBackend()
@@ -420,6 +496,7 @@ class InputBackendManagerTests(unittest.TestCase):
         self.assertEqual(providers[0].provider_id, "gamepad:11")
         self.assertEqual(providers[0].profile_label, "SDL3 Gamepad")
         self.assertIn("Instance ID: 11", providers[0].details)
+        self.assertIn("Motion Sensor: Default IMU", providers[0].details)
 
     def test_sdl3_backend_maps_standard_gamepad_layout(self):
         from nxbt.qt.input_backends.sdl3 import Sdl3GamepadBackend
@@ -510,6 +587,54 @@ class InputBackendManagerTests(unittest.TestCase):
         packet = backend.poll()[providers[0].provider_id]
 
         self.assertTrue(packet["CAPTURE"])
+
+    def test_sdl3_backend_uses_motion_sensors_when_available(self):
+        from nxbt.qt.input_backends.sdl3 import Sdl3GamepadBackend
+
+        gamepad = FakeSdl3Gamepad(
+            instance_id=55,
+            name="DualSense",
+            sensors={
+                FakeSdl3Module.SDL_SENSOR_ACCEL: (0.0, 9.80665, 0.0),
+                FakeSdl3Module.SDL_SENSOR_GYRO: (0.0, 0.0, 0.0),
+            },
+        )
+        backend = Sdl3GamepadBackend()
+        backend._sdl3 = FakeSdl3Module([gamepad])
+
+        provider = backend.list_providers()[0]
+        backend.claim(provider.provider_id, 0)
+        packet = backend.poll()[provider.provider_id]
+        providers = backend.list_providers()
+
+        self.assertEqual(packet["IMU_DATA"][0:6], [0x00, 0x00, 0x00, 0x00, 0x00, 0x10])
+        self.assertEqual(packet["IMU_DATA"][0:12], packet["IMU_DATA"][12:24])
+        self.assertEqual(packet["IMU_DATA"][12:24], packet["IMU_DATA"][24:36])
+        self.assertEqual(providers[0].motion_status, "Motion Sensor: SDL3")
+        self.assertTrue(providers[0].motion_available)
+
+    def test_sdl3_backend_falls_back_to_default_imu_without_full_motion_support(self):
+        from nxbt.qt.input_backends.sdl3 import Sdl3GamepadBackend
+        from nxbt.controller.imu import copy_default_imu_data
+
+        gamepad = FakeSdl3Gamepad(
+            instance_id=56,
+            name="Xbox Wireless Controller",
+            sensors={
+                FakeSdl3Module.SDL_SENSOR_GYRO: (0.0, 0.0, 0.0),
+            },
+        )
+        backend = Sdl3GamepadBackend()
+        backend._sdl3 = FakeSdl3Module([gamepad])
+
+        provider = backend.list_providers()[0]
+        backend.claim(provider.provider_id, 0)
+        packet = backend.poll()[provider.provider_id]
+        providers = backend.list_providers()
+
+        self.assertEqual(packet["IMU_DATA"], copy_default_imu_data())
+        self.assertEqual(providers[0].motion_status, "Motion Sensor: Default IMU")
+        self.assertFalse(providers[0].motion_available)
 
     def test_sdl3_backend_reports_missing_runtime_once(self):
         from nxbt.qt.input_backends.sdl3 import Sdl3GamepadBackend

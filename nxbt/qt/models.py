@@ -17,6 +17,8 @@ class InputProvider:
     profile_label: str = ""
     details: str = ""
     is_available: bool = True
+    motion_status: str = "Motion Sensor: Default IMU"
+    motion_available: bool = False
 
 
 @dataclass

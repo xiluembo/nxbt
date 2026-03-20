@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import ctypes
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..input_packets import create_input_packet, normalize_axis
 from ..models import InputProvider
+from ..motion import (
+    MOTION_STATUS_DEFAULT,
+    MOTION_STATUS_SENSOR,
+    MotionBuffer,
+    motion_details,
+)
 from .base import BaseInputBackend
 
 
@@ -17,6 +24,13 @@ SDL3_RUNTIME_ENV = {
     "SDL_LOG_LEVEL": "3",
 }
 SDL3_BINARY_NAMES = ("SDL3.dll", "SDL3d.dll")
+
+
+@dataclass
+class _ProviderMotionState:
+    buffer: MotionBuffer
+    accelerometer_sensor: int | None = None
+    gyroscope_sensor: int | None = None
 
 
 class Sdl3GamepadBackend(BaseInputBackend):
@@ -31,6 +45,8 @@ class Sdl3GamepadBackend(BaseInputBackend):
         self._provider_instance_ids: dict[str, int] = {}
         self._provider_names: dict[str, str] = {}
         self._open_gamepads: dict[str, object] = {}
+        self._motion_states: dict[str, _ProviderMotionState] = {}
+        self._init_flags = 0
 
     def list_providers(self) -> list[InputProvider]:
         sdl3 = self._ensure_sdl3()
@@ -45,16 +61,28 @@ class Sdl3GamepadBackend(BaseInputBackend):
             for instance_id in self._get_gamepad_ids():
                 provider_id = self._provider_id(instance_id)
                 provider_name = self._get_gamepad_name(instance_id)
+                motion_state = self._motion_states.get(provider_id)
+                motion_status = MOTION_STATUS_DEFAULT
+                motion_available = False
+                status_detail = "Motion sensor status is checked after assignment."
+                if motion_state is not None:
+                    motion_status = motion_state.buffer.motion_status
+                    motion_available = motion_state.buffer.motion_available
+                    status_detail = motion_state.buffer.status_detail
                 providers.append(
                     InputProvider(
                         backend_id=self.backend_id,
                         provider_id=provider_id,
                         display_name=provider_name,
                         profile_label=SDL3_PROFILE_LABEL,
-                        details=(
-                            f"Detected mapping: {SDL3_PROFILE_LABEL} | "
-                            f"Name: {provider_name} | Instance ID: {instance_id}"
+                        details=motion_details(
+                            provider_name=provider_name,
+                            instance_id=instance_id,
+                            motion_status=motion_status,
+                            status_detail=status_detail,
                         ),
+                        motion_status=motion_status,
+                        motion_available=motion_available,
                     )
                 )
                 self._provider_instance_ids[provider_id] = instance_id
@@ -82,11 +110,13 @@ class Sdl3GamepadBackend(BaseInputBackend):
             raise ValueError(self._format_sdl_error("Unable to open SDL3 gamepad"))
 
         self._open_gamepads[provider_id] = gamepad
+        self._motion_states[provider_id] = self._configure_motion_state(gamepad)
         self._claimed_provider_ids.add(provider_id)
 
     def release(self, provider_id: str, controller_index: int) -> None:
         self._claimed_provider_ids.discard(provider_id)
         gamepad = self._open_gamepads.pop(provider_id, None)
+        self._motion_states.pop(provider_id, None)
         if gamepad is None or self._sdl3 is None:
             return
         try:
@@ -115,7 +145,7 @@ class Sdl3GamepadBackend(BaseInputBackend):
             ):
                 self.release(provider_id, -1)
                 continue
-            packets[provider_id] = self._read_gamepad_packet(gamepad)
+            packets[provider_id] = self._read_gamepad_packet(provider_id, gamepad)
         return packets
 
     def shutdown(self) -> None:
@@ -125,9 +155,7 @@ class Sdl3GamepadBackend(BaseInputBackend):
             return
         try:
             if hasattr(self._sdl3, "SDL_QuitSubSystem"):
-                self._sdl3.SDL_QuitSubSystem(
-                    self._sdl3.SDL_INIT_GAMEPAD | self._sdl3.SDL_INIT_EVENTS
-                )
+                self._sdl3.SDL_QuitSubSystem(self._init_flags)
         except Exception:
             pass
         self._initialized = False
@@ -161,15 +189,14 @@ class Sdl3GamepadBackend(BaseInputBackend):
             return None
 
         if not self._initialized:
+            self._init_flags = self._sdl3.SDL_INIT_GAMEPAD | self._sdl3.SDL_INIT_EVENTS
+            if hasattr(self._sdl3, "SDL_INIT_SENSOR"):
+                self._init_flags |= self._sdl3.SDL_INIT_SENSOR
             try:
                 if hasattr(self._sdl3, "SDL_InitSubSystem"):
-                    result = self._sdl3.SDL_InitSubSystem(
-                        self._sdl3.SDL_INIT_GAMEPAD | self._sdl3.SDL_INIT_EVENTS
-                    )
+                    result = self._sdl3.SDL_InitSubSystem(self._init_flags)
                 else:
-                    result = self._sdl3.SDL_Init(
-                        self._sdl3.SDL_INIT_GAMEPAD | self._sdl3.SDL_INIT_EVENTS
-                    )
+                    result = self._sdl3.SDL_Init(self._init_flags)
             except Exception as exc:
                 self._unavailable_reason = (
                     "Unable to initialize the SDL3 gamepad subsystem. "
@@ -259,7 +286,7 @@ class Sdl3GamepadBackend(BaseInputBackend):
         if hasattr(self._sdl3, "SDL_PumpEvents"):
             self._sdl3.SDL_PumpEvents()
 
-    def _read_gamepad_packet(self, gamepad) -> dict:
+    def _read_gamepad_packet(self, provider_id: str, gamepad) -> dict:
         packet = create_input_packet()
         sdl3 = self._sdl3
 
@@ -321,8 +348,104 @@ class Sdl3GamepadBackend(BaseInputBackend):
         packet["DPAD_RIGHT"] = self._gamepad_button(
             gamepad, self._button_constant("DPAD_RIGHT")
         )
+        packet["IMU_DATA"] = self._build_motion_report(provider_id, gamepad)
 
         return packet
+
+    def _configure_motion_state(self, gamepad) -> _ProviderMotionState:
+        motion_state = _ProviderMotionState(buffer=MotionBuffer())
+        sdl3 = self._sdl3
+        if sdl3 is None or not hasattr(sdl3, "SDL_GamepadHasSensor"):
+            motion_state.buffer.status_detail = "SDL3 sensor APIs are unavailable."
+            return motion_state
+
+        accelerometer_sensor = getattr(sdl3, "SDL_SENSOR_ACCEL", None)
+        gyroscope_sensor = getattr(sdl3, "SDL_SENSOR_GYRO", None)
+        if accelerometer_sensor is None or gyroscope_sensor is None:
+            motion_state.buffer.status_detail = "Required SDL3 motion sensors are unavailable."
+            return motion_state
+
+        if not bool(sdl3.SDL_GamepadHasSensor(gamepad, accelerometer_sensor)) or not bool(
+            sdl3.SDL_GamepadHasSensor(gamepad, gyroscope_sensor)
+        ):
+            motion_state.buffer.status_detail = (
+                "No compatible motion sensors detected on this controller."
+            )
+            return motion_state
+
+        if not self._enable_sensor(gamepad, accelerometer_sensor) or not self._enable_sensor(
+            gamepad, gyroscope_sensor
+        ):
+            motion_state.buffer.status_detail = (
+                "Unable to enable motion sensors; using default IMU."
+            )
+            return motion_state
+
+        motion_state.accelerometer_sensor = accelerometer_sensor
+        motion_state.gyroscope_sensor = gyroscope_sensor
+        motion_state.buffer.motion_available = True
+        motion_state.buffer.motion_status = MOTION_STATUS_SENSOR
+        motion_state.buffer.status_detail = "Using accelerometer and gyroscope."
+        return motion_state
+
+    def _enable_sensor(self, gamepad, sensor_type: int) -> bool:
+        sdl3 = self._sdl3
+        if sdl3 is None or not hasattr(sdl3, "SDL_SetGamepadSensorEnabled"):
+            return False
+
+        try:
+            if hasattr(sdl3, "SDL_GamepadSensorEnabled") and bool(
+                sdl3.SDL_GamepadSensorEnabled(gamepad, sensor_type)
+            ):
+                return True
+            return bool(sdl3.SDL_SetGamepadSensorEnabled(gamepad, sensor_type, True))
+        except Exception:
+            return False
+
+    def _build_motion_report(self, provider_id: str, gamepad) -> list[int]:
+        motion_state = self._motion_states.get(provider_id)
+        if motion_state is None:
+            return MotionBuffer().build_report()
+
+        if (
+            not motion_state.buffer.motion_available
+            or motion_state.accelerometer_sensor is None
+            or motion_state.gyroscope_sensor is None
+        ):
+            return motion_state.buffer.build_report()
+
+        accelerometer_values = self._read_sensor_data(
+            gamepad, motion_state.accelerometer_sensor
+        )
+        gyroscope_values = self._read_sensor_data(
+            gamepad, motion_state.gyroscope_sensor
+        )
+        if accelerometer_values is None or gyroscope_values is None:
+            motion_state.buffer.motion_available = False
+            motion_state.buffer.motion_status = MOTION_STATUS_DEFAULT
+            motion_state.buffer.status_detail = "Motion sensor read failed."
+            motion_state.buffer.samples.clear()
+            return motion_state.buffer.build_report()
+
+        motion_state.buffer.push_sensor_sample(
+            accelerometer_values,
+            gyroscope_values,
+        )
+        return motion_state.buffer.build_report()
+
+    def _read_sensor_data(self, gamepad, sensor_type: int) -> tuple[float, float, float] | None:
+        sdl3 = self._sdl3
+        if sdl3 is None or not hasattr(sdl3, "SDL_GetGamepadSensorData"):
+            return None
+
+        buffer = (ctypes.c_float * 3)()
+        try:
+            success = sdl3.SDL_GetGamepadSensorData(gamepad, sensor_type, buffer, 3)
+        except Exception:
+            return None
+        if not bool(success):
+            return None
+        return (float(buffer[0]), float(buffer[1]), float(buffer[2]))
 
     def _axis_constant(self, name: str):
         for candidate in (

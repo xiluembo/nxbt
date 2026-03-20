@@ -3,6 +3,7 @@ import random
 from time import perf_counter
 
 from .controller import ControllerTypes
+from .imu import copy_default_imu_data, normalize_imu_data
 from .utils import replace_subarray
 
 
@@ -242,7 +243,7 @@ class ControllerProtocol:
         # Setting Report ID to full standard input report ID
         self.report[1] = 0x30
         self.set_standard_input_report()
-        self.set_imu_data()
+        self.set_standard_imu_data()
 
     def set_standard_input_report(self):
         self.set_timer()
@@ -331,49 +332,22 @@ class ControllerProtocol:
         # Subcommand reply
         self.report[15] = 0x40
 
-    def set_imu_data(self):
+    def set_standard_imu_data(self):
         if not self.imu_enabled:
             return
 
-        imu_data = [
-            0x75,
-            0xFD,
-            0xFD,
-            0xFF,
-            0x09,
-            0x10,
-            0x21,
-            0x00,
-            0xD5,
-            0xFF,
-            0xE0,
-            0xFF,
-            0x72,
-            0xFD,
-            0xF9,
-            0xFF,
-            0x0A,
-            0x10,
-            0x22,
-            0x00,
-            0xD5,
-            0xFF,
-            0xE0,
-            0xFF,
-            0x76,
-            0xFD,
-            0xFC,
-            0xFF,
-            0x09,
-            0x10,
-            0x23,
-            0x00,
-            0xD5,
-            0xFF,
-            0xE0,
-            0xFF,
-        ]
-        replace_subarray(self.report, 14, 49, replace_arr=imu_data)
+        replace_subarray(self.report, 14, 49, replace_arr=copy_default_imu_data())
+
+    def set_imu_data(self, imu_data=None):
+        if not self.imu_enabled:
+            return
+
+        normalized = normalize_imu_data(imu_data)
+        if normalized is None:
+            self.set_standard_imu_data()
+            return
+
+        replace_subarray(self.report, 14, 49, replace_arr=normalized)
 
     def spi_read(self, message):
         addr_top = message.subcommand[2]
