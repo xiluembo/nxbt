@@ -89,20 +89,13 @@ class CliReconnectResolutionTests(unittest.TestCase):
 
     def test_webapp_bind_error_prints_helpful_message(self):
         output = io.StringIO()
-        fake_web_module = types.SimpleNamespace(
-            start_web_app=lambda **kwargs: (_ for _ in ()).throw(
-                OSError("Unable to bind the NXBT webapp to 0.0.0.0:8000.")
-            )
+        fake_web_module = types.ModuleType("nxbt.web")
+        fake_web_module.start_web_app = lambda **kwargs: (_ for _ in ()).throw(
+            OSError("Unable to bind the NXBT webapp to 0.0.0.0:8000.")
         )
-        real_import = __import__
-
-        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "nxbt.web":
-                return fake_web_module
-            return real_import(name, globals, locals, fromlist, level)
 
         with redirect_stdout(output):
-            with patch("builtins.__import__", side_effect=fake_import):
+            with patch.dict(sys.modules, {"nxbt.web": fake_web_module}):
                 _start_webapp("0.0.0.0", 8000, False, None)
 
         self.assertIn("Unable to bind the NXBT webapp", output.getvalue())
