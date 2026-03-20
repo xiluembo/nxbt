@@ -89,17 +89,6 @@ def _default_transport() -> str:
     return os.environ.get(TRANSPORT_ENV_VAR, DEFAULT_TRANSPORT)
 
 
-def _firmware_setup_instructions() -> list[str]:
-    return [
-        (
-            "If this adapter is Realtek-based, install the Bumble firmware files "
-            f"(for example {REALTEK_FIRMWARE_REFERENCE}) in '.bumble-firmware' "
-            f"or point {FIRMWARE_ENV_VAR} to that directory."
-        ),
-        f"Reference: {REALTEK_FIRMWARE_HELP_URL}",
-    ]
-
-
 def _parse_device_class(device_class: str | int) -> int:
     if isinstance(device_class, int):
         return device_class
@@ -1368,9 +1357,6 @@ class BumbleBackend(BaseBackend):
                 )
                 if firmware_dir.exists()
                 else [],
-                "firmware_reference": REALTEK_FIRMWARE_REFERENCE,
-                "firmware_help_url": REALTEK_FIRMWARE_HELP_URL,
-                "firmware_setup_instructions": _firmware_setup_instructions(),
                 "message": adapter_error,
             }
 
@@ -1386,7 +1372,6 @@ class BumbleBackend(BaseBackend):
             if firmware_dir.exists()
             else []
         )
-        firmware_instructions = _firmware_setup_instructions()
         return {
             "name": self.name,
             "supported": True,
@@ -1398,9 +1383,6 @@ class BumbleBackend(BaseBackend):
             "unavailable_adapter_details": unavailable_adapter_details,
             "firmware_dir": str(firmware_dir),
             "firmware_files": firmware_files,
-            "firmware_reference": REALTEK_FIRMWARE_REFERENCE,
-            "firmware_help_url": REALTEK_FIRMWARE_HELP_URL,
-            "firmware_setup_instructions": firmware_instructions,
             "message": (
                 "Bumble backend ready."
                 if available
