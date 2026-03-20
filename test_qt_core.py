@@ -9,6 +9,16 @@ from nxbt.qt.input_backends.keyboard import KeyboardInputBackend
 from nxbt.qt.input_backends.manager import InputBackendManager
 from nxbt.qt.models import InputProvider
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+try:
+    from PyQt6.QtWidgets import QApplication
+
+    from nxbt.qt.widgets.create_controller_dialog import CreateControllerDialog
+except Exception:  # pragma: no cover - optional desktop dependency
+    QApplication = None
+    CreateControllerDialog = None
+
 
 class FakeNxbt:
     def __init__(self):
@@ -273,10 +283,22 @@ class ControllerManagerTests(unittest.TestCase):
             ["11:22:33:44:55:66"],
         )
 
+    def test_saved_switch_addresses_are_grouped_by_adapter(self):
+        manager = ControllerManager(nx=FakeNxbt())
+
+        addresses = manager.get_saved_switch_addresses_by_adapter(
+            ["adapter-0", "adapter-1"]
+        )
+
+        self.assertEqual(addresses["adapter-0"], ["AA:BB:CC:DD:EE:FF"])
+        self.assertEqual(addresses["adapter-1"], ["11:22:33:44:55:66"])
+
     def test_saved_switch_metadata_is_grouped_by_adapter(self):
         manager = ControllerManager(nx=FakeNxbt())
 
-        metadata = manager.get_saved_switch_metadata_by_adapter(["adapter-0", "adapter-1"])
+        metadata = manager.get_saved_switch_metadata_by_adapter(
+            ["adapter-0", "adapter-1"]
+        )
 
         self.assertEqual(
             metadata["adapter-0"]["AA:BB:CC:DD:EE:FF"]["colour_body"],
@@ -296,6 +318,54 @@ class ControllerManagerTests(unittest.TestCase):
         self.assertEqual(
             nx.forgot_pairings,
             [("adapter-0", "AA:BB:CC:DD:EE:FF")],
+        )
+
+
+@unittest.skipIf(
+    QApplication is None or CreateControllerDialog is None,
+    "PyQt6 is not available",
+)
+class CreateControllerDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_dialog_lists_saved_addresses_without_metadata(self):
+        dialog = CreateControllerDialog(
+            adapters=["adapter-0"],
+            saved_addresses_by_adapter={
+                "adapter-0": ["AA:BB:CC:DD:EE:FF", "11:22:33:44:55:66"]
+            },
+            saved_metadata_by_adapter={
+                "adapter-0": {
+                    "AA:BB:CC:DD:EE:FF": {
+                        "colour_body": [10, 20, 30],
+                        "colour_buttons": [40, 50, 60],
+                    }
+                }
+            },
+        )
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertEqual(dialog.reconnect_combo.count(), 3)
+        self.assertEqual(
+            dialog.reconnect_combo.itemData(1),
+            "AA:BB:CC:DD:EE:FF",
+        )
+        self.assertEqual(
+            dialog.reconnect_combo.itemData(2),
+            "11:22:33:44:55:66",
+        )
+
+        dialog.reconnect_combo.setCurrentIndex(2)
+
+        self.assertEqual(
+            dialog.body_color(),
+            CreateControllerDialog.DEFAULT_BODY_COLOR,
+        )
+        self.assertEqual(
+            dialog.button_color(),
+            CreateControllerDialog.DEFAULT_BUTTON_COLOR,
         )
 
 

@@ -193,6 +193,9 @@ class MainWindow(QMainWindow):
 
         dialog = CreateControllerDialog(
             adapters=adapters,
+            saved_addresses_by_adapter=(
+                self.controller_manager.get_saved_switch_addresses_by_adapter(adapters)
+            ),
             saved_metadata_by_adapter=(
                 self.controller_manager.get_saved_switch_metadata_by_adapter(adapters)
             ),

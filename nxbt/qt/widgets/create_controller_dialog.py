@@ -29,6 +29,7 @@ class CreateControllerDialog(QDialog):
         self,
         *,
         adapters,
+        saved_addresses_by_adapter,
         saved_metadata_by_adapter,
         forget_pairing_callback=None,
         parent=None,
@@ -38,6 +39,10 @@ class CreateControllerDialog(QDialog):
         self._body_color = self.DEFAULT_BODY_COLOR
         self._button_color = self.DEFAULT_BUTTON_COLOR
         self._forget_pairing_callback = forget_pairing_callback
+        self._saved_addresses_by_adapter = {
+            adapter: list(addresses)
+            for adapter, addresses in saved_addresses_by_adapter.items()
+        }
         self._saved_metadata_by_adapter = {
             adapter: dict(addresses)
             for adapter, addresses in saved_metadata_by_adapter.items()
@@ -130,7 +135,7 @@ class CreateControllerDialog(QDialog):
         self.reconnect_combo.addItem("Pair New Switch", None)
 
         adapter = self.selected_adapter()
-        for address in self._saved_metadata_by_adapter.get(adapter, {}).keys():
+        for address in self._saved_addresses_by_adapter.get(adapter, []):
             self.reconnect_combo.addItem(f"Reconnect to {address}", address)
 
         restored_index = self.reconnect_combo.findData(selected_address)
@@ -183,6 +188,9 @@ class CreateControllerDialog(QDialog):
             QMessageBox.critical(self, "Unable to Forget Pairing", str(exc))
             return
 
+        saved_addresses = self._saved_addresses_by_adapter.get(adapter, [])
+        if address in saved_addresses:
+            saved_addresses.remove(address)
         self._saved_metadata_by_adapter.get(adapter, {}).pop(address, None)
         self._refresh_reconnect_options()
 
